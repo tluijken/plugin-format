@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
 use vst3::Steinberg::Vst::BusInfo_::BusFlags_::kDefaultActive;
-use vst3::Steinberg::Vst::BusTypes_::kMain;
+use vst3::Steinberg::Vst::BusTypes_::{kAux, kMain};
 use vst3::Steinberg::Vst::MediaTypes_::kAudio;
 use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
+use vst3::Steinberg::Vst::IProcessContextRequirements_::Flags_::kNeedTransportState;
+use vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kPlaying;
 use vst3::Steinberg::Vst::RestartFlags_::{kLatencyChanged, kParamValuesChanged};
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
 use vst3::Steinberg::Vst::*;
@@ -19,7 +21,7 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 use vst3::Steinberg::Linux::IRunLoopTrait;
 
 use crate::editor::{self, Parent};
-use crate::{Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
+use crate::{Extras, Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
 
 const CATEGORY: &str = "Audio Module Class";
 
@@ -182,6 +184,7 @@ struct Component<P: Plugin> {
     /// Changed only while `plugin` is claimed, so a claimant sees it consistent with `plugin`.
     active: AtomicBool,
     inputs: AtomicU32,
+    sidechain_active: AtomicBool,
     sample_rate: AtomicU64,
     /// 0 until `setupProcessing`.
     max_block: AtomicU32,
@@ -240,6 +243,7 @@ impl<P: Plugin> Component<P> {
             shared,
             active: AtomicBool::new(false),
             inputs: AtomicU32::new(1),
+            sidechain_active: AtomicBool::new(false),
             sample_rate: AtomicU64::new(0),
             max_block: AtomicU32::new(0),
             host: Arc::new(Host {
@@ -318,6 +322,31 @@ impl<P: Plugin> Component<P> {
         }
     }
 
+    /// The aux input bus when the plugin has one, the host activated it and gave both its channels.
+    unsafe fn sidechain(&self, data: &ProcessData) -> Option<[*const f32; 2]> {
+        unsafe {
+            if !P::INFO.sidechain || !self.sidechain_active.load(Ordering::Acquire) || data.numInputs < 2 || data.inputs.is_null() {
+                return None;
+            }
+            let bus = &*data.inputs.add(1);
+            let buffers = bus.__field0.channelBuffers32;
+            if bus.numChannels < 2 || buffers.is_null() {
+                return None;
+            }
+            let (left, right) = (*buffers as *const f32, *buffers.add(1) as *const f32);
+            (!left.is_null() && !right.is_null()).then_some([left, right])
+        }
+    }
+
+    /// `projectTimeSamples` has no validity flag of its own: a host that gives a context fills it.
+    fn position(data: &ProcessData) -> Option<i64> {
+        unsafe { data.processContext.as_ref() }.map(|context| context.projectTimeSamples)
+    }
+
+    fn playing(data: &ProcessData) -> bool {
+        unsafe { data.processContext.as_ref() }.is_some_and(|context| context.state & kPlaying as uint32 != 0)
+    }
+
     unsafe fn run(&self, data: &ProcessData) -> tresult {
         unsafe {
             if data.numSamples <= 0 {
@@ -361,11 +390,12 @@ impl<P: Plugin> Component<P> {
                 }
             }
             let configured = self.inputs.load(Ordering::Acquire) as usize;
+            let extras = Extras { sidechain: self.sidechain(data), position: Self::position(data), playing: Self::playing(data) };
             let played = self.claim(|plugin| {
                 if !self.active.load(Ordering::Acquire) {
                     return kResultFalse;
                 }
-                process_block(plugin, frames, &outs[..count], &ins[..inputs], configured);
+                process_block(plugin, frames, &outs[..count], &ins[..inputs], configured, extras);
                 if plugin.take_latency_changed() {
                     self.host.new_latency.store(plugin.latency(), Ordering::Release);
                     self.host.latency_changed.store(true, Ordering::Release);
@@ -440,16 +470,25 @@ impl<P: Plugin> IComponentTrait for Component<P> {
     }
 
     unsafe fn getBusCount(&self, media: MediaType, dir: BusDirection) -> int32 {
-        (media == kAudio as MediaType && (dir == kInput as BusDirection || dir == kOutput as BusDirection)) as int32
+        if media != kAudio as MediaType {
+            return 0;
+        }
+        match dir {
+            d if d == kInput as BusDirection => 1 + P::INFO.sidechain as int32,
+            d if d == kOutput as BusDirection => 1,
+            _ => 0,
+        }
     }
 
     unsafe fn getBusInfo(&self, media: MediaType, dir: BusDirection, index: int32, bus: *mut BusInfo) -> tresult {
         guard(kInternalError, || {
-            if media != kAudio as MediaType || index != 0 || bus.is_null() {
+            let input = dir == kInput as BusDirection;
+            if media != kAudio as MediaType || bus.is_null() || index < 0 || index > (input && P::INFO.sidechain) as int32 {
                 return kInvalidArgument;
             }
             let (channels, name) = match dir {
-                d if d == kInput as BusDirection => (self.inputs.load(Ordering::Acquire) as int32, "Input"),
+                _ if input && index == 1 => (2, "Sidechain"),
+                _ if input => (self.inputs.load(Ordering::Acquire) as int32, "Input"),
                 d if d == kOutput as BusDirection => (2, "Output"),
                 _ => return kInvalidArgument,
             };
@@ -458,8 +497,9 @@ impl<P: Plugin> IComponentTrait for Component<P> {
             info.direction = dir;
             info.channelCount = channels;
             copy_wide(name, &mut info.name);
-            info.busType = kMain as BusType;
-            info.flags = kDefaultActive as uint32;
+            let aux = input && index == 1;
+            info.busType = if aux { kAux } else { kMain } as BusType;
+            info.flags = if aux { 0 } else { kDefaultActive as uint32 };
             unsafe { bus.write(info) };
             kResultOk
         })
@@ -469,8 +509,19 @@ impl<P: Plugin> IComponentTrait for Component<P> {
         kNotImplemented
     }
 
-    unsafe fn activateBus(&self, media: MediaType, _dir: BusDirection, index: int32, _state: TBool) -> tresult {
-        if media == kAudio as MediaType && index == 0 { kResultOk } else { kInvalidArgument }
+    unsafe fn activateBus(&self, media: MediaType, dir: BusDirection, index: int32, state: TBool) -> tresult {
+        if media != kAudio as MediaType {
+            return kInvalidArgument;
+        }
+        let input = dir == kInput as BusDirection;
+        match index {
+            0 if input || dir == kOutput as BusDirection => kResultOk,
+            1 if input && P::INFO.sidechain => {
+                self.sidechain_active.store(state != 0, Ordering::Release);
+                kResultOk
+            }
+            _ => kInvalidArgument,
+        }
     }
 
     unsafe fn setActive(&self, state: TBool) -> tresult {
@@ -489,7 +540,11 @@ impl<P: Plugin> IComponentTrait for Component<P> {
 impl<P: Plugin> IAudioProcessorTrait for Component<P> {
     unsafe fn setBusArrangements(&self, inputs: *mut SpeakerArrangement, num_ins: int32, outputs: *mut SpeakerArrangement, num_outs: int32) -> tresult {
         guard(kInternalError, || unsafe {
-            if num_ins != 1 || num_outs != 1 || inputs.is_null() || outputs.is_null() || *outputs != SpeakerArr::kStereo {
+            let buses = 1 + P::INFO.sidechain as int32;
+            if num_ins != buses || num_outs != 1 || inputs.is_null() || outputs.is_null() || *outputs != SpeakerArr::kStereo {
+                return kResultFalse;
+            }
+            if P::INFO.sidechain && *inputs.add(1) != SpeakerArr::kStereo {
                 return kResultFalse;
             }
             let channels = match *inputs {
@@ -507,10 +562,11 @@ impl<P: Plugin> IAudioProcessorTrait for Component<P> {
 
     unsafe fn getBusArrangement(&self, dir: BusDirection, index: int32, arr: *mut SpeakerArrangement) -> tresult {
         guard(kInternalError, || {
-            if index != 0 || arr.is_null() {
+            if index < 0 || index > (dir == kInput as BusDirection && P::INFO.sidechain) as int32 || arr.is_null() {
                 return kInvalidArgument;
             }
             let arrangement = match dir {
+                d if d == kInput as BusDirection && index == 1 => SpeakerArr::kStereo,
                 d if d == kInput as BusDirection && self.inputs.load(Ordering::Acquire) == 1 => SpeakerArr::kMono,
                 d if d == kInput as BusDirection || d == kOutput as BusDirection => SpeakerArr::kStereo,
                 _ => return kInvalidArgument,
@@ -562,7 +618,7 @@ impl<P: Plugin> IAudioProcessorTrait for Component<P> {
 
 impl<P: Plugin> IProcessContextRequirementsTrait for Component<P> {
     unsafe fn getProcessContextRequirements(&self) -> uint32 {
-        0
+        kNeedTransportState as uint32
     }
 }
 
@@ -898,7 +954,7 @@ mod tests {
     use vst3::Interface;
 
     use super::*;
-    use crate::{Info, Shared};
+    use crate::{Block, Info, Shared};
 
     struct Fixed;
 
@@ -945,6 +1001,7 @@ mod tests {
             clap_features: &[],
             vst3_class_id: *b"testDoublerClass",
             vst3_subcategories: "Fx",
+            sidechain: false,
         };
         const EDITOR_SIZE: (u32, u32) = (1, 1);
         type Shared = Fixed;
@@ -960,8 +1017,8 @@ mod tests {
         fn latency(&self) -> u32 {
             self.latency
         }
-        fn process(&mut self, channels: &mut [&mut [f32]]) {
-            for s in channels[0].iter_mut() {
+        fn process(&mut self, block: Block<'_>) {
+            for s in block.channels[0].iter_mut() {
                 *s *= 2.0;
             }
             self.latency = 7;

@@ -17,6 +17,21 @@ pub struct Info {
     pub clap_features: &'static [&'static CStr],
     pub vst3_class_id: [u8; 16],
     pub vst3_subcategories: &'static str,
+    /// A stereo sidechain input the host may leave unconnected: a second CLAP input port, a VST3 aux
+    /// input bus that starts inactive.
+    pub sidechain: bool,
+}
+
+/// What one call of `Plugin::process` works on.
+pub struct Block<'a> {
+    /// The output channels, filled with the input beforehand by the wrapper (mono input copied to
+    /// output channel 0 only).
+    pub channels: &'a mut [&'a mut [f32]],
+    /// `None` unless `Info::sidechain` is set and the host connected both channels of the sidechain.
+    pub sidechain: Option<[&'a [f32]; 2]>,
+    /// The timeline position in samples of the block's first frame; `None` when the host gave none.
+    pub position: Option<i64>,
+    pub playing: bool,
 }
 
 /// The half of a plugin that any thread may use at any time, also while the audio half processes.
@@ -47,9 +62,7 @@ pub trait Plugin: Send + Sized + 'static {
     fn deactivate(&mut self);
     /// Read once before the first `activate`; after that the wrapper reports what `activate` returned.
     fn latency(&self) -> u32;
-    /// `channels` are the output channels, filled with the input beforehand by the wrapper
-    /// (mono input copied to output channel 0 only).
-    fn process(&mut self, channels: &mut [&mut [f32]]);
+    fn process(&mut self, block: Block<'_>);
     /// True once after `process` changed the latency; the wrapper then tells the host.
     fn take_latency_changed(&mut self) -> bool;
 }
@@ -102,6 +115,13 @@ fn guard<R>(failed: R, body: impl FnOnce() -> R) -> R {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(failed)
 }
 
+/// What the host said about transport, and the sidechain if it gave one.
+struct Extras {
+    sidechain: Option<[*const f32; 2]>,
+    position: Option<i64>,
+    playing: bool,
+}
+
 /// Fills the output channels from the input and lets `plugin` process them in place: input channel
 /// `c` goes to output `c` when `c < configured`, a missing one becomes silence, and outputs from
 /// `configured` on are left to the plugin.
@@ -109,7 +129,8 @@ fn guard<R>(failed: R, body: impl FnOnce() -> R) -> R {
 /// # Safety
 /// `outs` holds one or two distinct channels, each valid for `frames` writes. Every non-null `ins[c]`
 /// is valid for `frames` reads and is either the same memory as `outs[c]` or overlaps no output.
-unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f32], ins: &[*const f32], configured: usize) {
+/// A `sidechain` is valid for `frames` reads and overlaps no output.
+unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f32], ins: &[*const f32], configured: usize, extras: Extras) {
     unsafe {
         for (c, &out) in outs.iter().enumerate() {
             let source = if c < configured { ins.get(c).copied().unwrap_or(std::ptr::null()) } else { std::ptr::null() };
@@ -125,7 +146,9 @@ unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f
         for (channel, &out) in channels.iter_mut().zip(outs) {
             *channel = std::slice::from_raw_parts_mut(out, frames);
         }
-        plugin.process(&mut channels[..outs.len().min(2)]);
+        let sidechain = extras.sidechain.map(|[left, right]| [std::slice::from_raw_parts(left, frames), std::slice::from_raw_parts(right, frames)]);
+        let count = outs.len().min(2);
+        plugin.process(Block { channels: &mut channels[..count], sidechain, position: extras.position, playing: extras.playing });
     }
 }
 

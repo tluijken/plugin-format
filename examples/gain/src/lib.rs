@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
-use plugin_format::{Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
+use plugin_format::{Block, Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
 
 pub const GAIN: u32 = 0;
 pub const FREQUENCY: u32 = 1;
@@ -87,6 +87,7 @@ impl Plugin for Gain {
         clap_features: &[c"audio-effect", c"stereo", c"mono", c"utility"],
         vst3_class_id: *b"plugfmtGainExamp",
         vst3_subcategories: "Fx",
+        sidechain: false,
     };
     const EDITOR_SIZE: (u32, u32) = (200, 100);
 
@@ -108,7 +109,8 @@ impl Plugin for Gain {
         0
     }
 
-    fn process(&mut self, channels: &mut [&mut [f32]]) {
+    fn process(&mut self, block: Block<'_>) {
+        let channels = block.channels;
         let factor = 10f32.powf(self.shared.db.load(Ordering::Relaxed) as f32 / 20.0);
         for channel in channels.iter_mut() {
             for sample in channel.iter_mut() {

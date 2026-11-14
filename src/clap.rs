@@ -3,19 +3,21 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 #[doc(hidden)]
 pub use clap_sys as sys;
 
 use clap_sys::entry::clap_plugin_entry;
-use clap_sys::events::{CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, clap_event_param_value, clap_input_events, clap_output_events};
+use clap_sys::events::{
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_IS_PLAYING, clap_event_param_value, clap_input_events, clap_output_events};
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
@@ -25,7 +27,7 @@ use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
 use crate::editor::{self, Parent};
-use crate::{Kind, Plugin, Shared, copy_str, guard, process_block};
+use crate::{Extras, Kind, Plugin, Shared, copy_str, guard, process_block};
 
 fn same(a: *const c_char, b: &CStr) -> bool {
     !a.is_null() && unsafe { CStr::from_ptr(a) } == b
@@ -123,6 +125,7 @@ struct Instance<P: Plugin> {
     shared: Arc<P::Shared>,
     active: AtomicBool,
     inputs: AtomicU32,
+    sample_rate: AtomicU64,
     /// What `activate` last reported. `latency.get` serves only this, since a host may call it from
     /// inside `host_latency.changed()` while `activate` still holds the processor.
     latency: AtomicU32,
@@ -154,6 +157,7 @@ impl<P: Plugin> Instance<P> {
             shared,
             active: AtomicBool::new(false),
             inputs: AtomicU32::new(1),
+            sample_rate: AtomicU64::new(0),
             latency: AtomicU32::new(latency),
             host_latency: AtomicPtr::new(ptr::null_mut()),
             gui: Mutex::default(),
@@ -208,6 +212,7 @@ impl<P: Plugin> Instance<P> {
             if max == 0 || instance.active.load(Ordering::Acquire) {
                 return false;
             }
+            instance.sample_rate.store(sample_rate.to_bits(), Ordering::Relaxed);
             let inputs = instance.inputs.load(Ordering::Relaxed) as usize;
             let latency = unsafe { instance.plugin_mut() }.activate(sample_rate, max as usize, inputs);
             let previous = instance.latency.swap(latency, Ordering::AcqRel);
@@ -291,9 +296,38 @@ impl<P: Plugin> Instance<P> {
                 }
             }
             let configured = self.inputs.load(Ordering::Relaxed) as usize;
-            process_block(self.plugin_mut(), frames, &outs[..count], &ins[..inputs], configured);
+            let extras = Extras { sidechain: self.sidechain(process), position: self.position(process), playing: self.playing(process) };
+            process_block(self.plugin_mut(), frames, &outs[..count], &ins[..inputs], configured, extras);
             CLAP_PROCESS_CONTINUE
         }
+    }
+
+    /// The second input port when the plugin has one and the host connected both its channels.
+    unsafe fn sidechain(&self, process: &clap_process) -> Option<[*const f32; 2]> {
+        unsafe {
+            if !P::INFO.sidechain || process.audio_inputs_count < 2 || process.audio_inputs.is_null() {
+                return None;
+            }
+            let port = &*process.audio_inputs.add(1);
+            if port.channel_count < 2 || port.data32.is_null() {
+                return None;
+            }
+            let (left, right) = (*port.data32 as *const f32, *port.data32.add(1) as *const f32);
+            (!left.is_null() && !right.is_null()).then_some([left, right])
+        }
+    }
+
+    fn position(&self, process: &clap_process) -> Option<i64> {
+        let transport = unsafe { process.transport.as_ref() }?;
+        if transport.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE == 0 {
+            return None;
+        }
+        let rate = f64::from_bits(self.sample_rate.load(Ordering::Relaxed));
+        Some((transport.song_pos_seconds as f64 / CLAP_SECTIME_FACTOR as f64 * rate).round() as i64)
+    }
+
+    fn playing(&self, process: &clap_process) -> bool {
+        unsafe { process.transport.as_ref() }.is_some_and(|transport| transport.flags & CLAP_TRANSPORT_IS_PLAYING != 0)
     }
 
     fn apply(&self, events: *const clap_input_events) {
@@ -486,14 +520,20 @@ impl<P: Plugin> Instance<P> {
 
     const AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports { count: Some(Self::port_count), get: Some(Self::port) };
 
-    unsafe extern "C" fn port_count(_: *const clap_plugin, _is_input: bool) -> u32 {
-        1
+    unsafe extern "C" fn port_count(_: *const clap_plugin, is_input: bool) -> u32 {
+        1 + (is_input && P::INFO.sidechain) as u32
     }
 
     unsafe extern "C" fn port(plugin: *const clap_plugin, index: u32, is_input: bool, out: *mut clap_audio_port_info) -> bool {
         Self::with(plugin, || false, |instance| {
-            if index != 0 || out.is_null() {
+            if out.is_null() || index > (is_input && P::INFO.sidechain) as u32 {
                 return false;
+            }
+            if index == 1 {
+                let mut info = clap_audio_port_info { id: 1, name: [0; _], flags: 0, channel_count: 2, port_type: CLAP_PORT_STEREO.as_ptr(), in_place_pair: CLAP_INVALID_ID };
+                copy_str("Sidechain", &mut info.name);
+                unsafe { out.write(info) };
+                return true;
             }
             let channels = if is_input { instance.inputs.load(Ordering::Relaxed) } else { 2 };
             let mut info = clap_audio_port_info {
@@ -722,7 +762,7 @@ mod tests {
     use clap_sys::audio_buffer::clap_audio_buffer;
 
     use super::*;
-    use crate::{Info, Kind, ParamInfo};
+    use crate::{Block, Info, Kind, ParamInfo};
 
     struct Fixed;
 
@@ -770,6 +810,7 @@ mod tests {
             clap_features: &[c"audio-effect"],
             vst3_class_id: [0; 16],
             vst3_subcategories: "Fx",
+            sidechain: false,
         };
         const EDITOR_SIZE: (u32, u32) = (1, 1);
         type Shared = Fixed;
@@ -785,8 +826,8 @@ mod tests {
         fn latency(&self) -> u32 {
             0
         }
-        fn process(&mut self, channels: &mut [&mut [f32]]) {
-            for s in channels[0].iter_mut() {
+        fn process(&mut self, block: Block<'_>) {
+            for s in block.channels[0].iter_mut() {
                 *s *= 2.0;
             }
             self.changed = true;
@@ -869,8 +910,8 @@ mod tests {
         fn latency(&self) -> u32 {
             0
         }
-        fn process(&mut self, channels: &mut [&mut [f32]]) {
-            self.0.process(channels)
+        fn process(&mut self, block: Block<'_>) {
+            self.0.process(block)
         }
         fn take_latency_changed(&mut self) -> bool {
             self.0.take_latency_changed()
