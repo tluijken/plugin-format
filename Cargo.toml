@@ -1,8 +1,17 @@
 [package]
-name = "nx-format"
-version.workspace = true
-edition.workspace = true
-publish.workspace = true
+name = "plugin-format"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "CLAP and VST3 export for a plugin written once against a small trait, with an egui editor"
+publish = false
+
+[lib]
+name = "plugin_format"
+
+[workspace]
+resolver = "3"
+members = ["examples/gain"]
 
 [dependencies]
 clap-sys = "0.5"
@@ -11,4 +20,12 @@ egui = "0.37"
 # "log" because 0.9 does not build without a logging feature.
 egui-baseview = { version = "0.9", default-features = false, features = ["opengl", "log"] }
 raw-window-handle = "0.6"
+vst3 = "0.3"
+
+# The host tests load the example's library, so building it is part of testing this crate.
+[dev-dependencies]
+gain = { path = "examples/gain" }
+clap-sys = "0.5"
+libloading = "0.8"
+serde_json = "1"
 vst3 = "0.3"

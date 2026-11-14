@@ -1,4 +1,4 @@
-use nx_format::{Kind, ParamInfo};
+use plugin_format::{Kind, ParamInfo};
 
 #[test]
 fn every_int_value_survives_normalising_and_back() {
