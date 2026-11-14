@@ -1,0 +1,8 @@
+[package]
+name = "nx-format"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+egui = "0.37"
