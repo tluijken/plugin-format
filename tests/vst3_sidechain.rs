@@ -2,7 +2,6 @@
 
 #![allow(non_snake_case)]
 
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -14,11 +13,8 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, Interface};
 
-fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let name = if cfg!(windows) { "sidechain.dll" } else { "libsidechain.so" };
-    exe.parent().unwrap().join(name)
-}
+mod built;
+mod vst3_module;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -28,24 +24,7 @@ fn turn() -> MutexGuard<'static, ()> {
 
 fn library() -> &'static libloading::Library {
     static LIBRARY: OnceLock<libloading::Library> = OnceLock::new();
-    LIBRARY.get_or_init(|| {
-        let path = plugin_path();
-        assert!(path.exists(), "{} not built", path.display());
-        unsafe {
-            let library = libloading::Library::new(&path).unwrap();
-            #[cfg(windows)]
-            {
-                let entry: libloading::Symbol<extern "system" fn() -> bool> = library.get(b"InitDll\0").unwrap();
-                assert!(entry());
-            }
-            #[cfg(not(windows))]
-            {
-                let entry: libloading::Symbol<extern "system" fn(*mut std::ffi::c_void) -> bool> = library.get(b"ModuleEntry\0").unwrap();
-                assert!(entry(ptr::null_mut()));
-            }
-            library
-        }
-    })
+    LIBRARY.get_or_init(|| vst3_module::load(&built::plugin("sidechain", "vst3")))
 }
 
 struct Instance {

@@ -1,7 +1,6 @@
 //! Loads the example plugin's built CLAP library the way a host does and runs audio through it.
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -14,7 +13,7 @@ use clap_sys::events::{
 };
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
-use clap_sys::ext::gui::{CLAP_EXT_GUI, CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11, clap_plugin_gui, clap_window, clap_window_handle};
+use clap_sys::ext::gui::{self as gui_ext, CLAP_EXT_GUI, CLAP_WINDOW_API_WAYLAND, clap_plugin_gui, clap_window, clap_window_handle};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags, clap_plugin_params};
 use clap_sys::ext::track_info::{CLAP_EXT_TRACK_INFO, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info, clap_plugin_track_info, clap_track_info};
@@ -27,25 +26,30 @@ use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
 use gain::{FREQUENCY, GAIN, TEST_GESTURE};
 
-fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let name = if cfg!(windows) { "gain.dll" } else { "libgain.so" };
-    exe.parent().unwrap().join(name)
+mod built;
+
+fn plugin() -> &'static built::Built {
+    static PLUGIN: OnceLock<built::Built> = OnceLock::new();
+    PLUGIN.get_or_init(|| built::plugin("gain", "clap"))
 }
 
 #[cfg(windows)]
-const NATIVE_API: &CStr = CLAP_WINDOW_API_WIN32;
-#[cfg(not(windows))]
-const NATIVE_API: &CStr = CLAP_WINDOW_API_X11;
+const NATIVE_API: &CStr = gui_ext::CLAP_WINDOW_API_WIN32;
+#[cfg(target_os = "macos")]
+const NATIVE_API: &CStr = gui_ext::CLAP_WINDOW_API_COCOA;
+#[cfg(not(any(windows, target_os = "macos")))]
+const NATIVE_API: &CStr = gui_ext::CLAP_WINDOW_API_X11;
 #[cfg(windows)]
-const OTHER_API: &CStr = CLAP_WINDOW_API_X11;
+const OTHER_API: &CStr = gui_ext::CLAP_WINDOW_API_X11;
 #[cfg(not(windows))]
-const OTHER_API: &CStr = CLAP_WINDOW_API_WIN32;
+const OTHER_API: &CStr = gui_ext::CLAP_WINDOW_API_WIN32;
 
 fn no_window() -> clap_window {
     #[cfg(windows)]
     let specific = clap_window_handle { win32: ptr::null_mut() };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let specific = clap_window_handle { cocoa: ptr::null_mut() };
+    #[cfg(not(any(windows, target_os = "macos")))]
     let specific = clap_window_handle { x11: 0 };
     clap_window { api: NATIVE_API.as_ptr(), specific }
 }
@@ -59,11 +63,7 @@ fn turn() -> MutexGuard<'static, ()> {
 
 fn library() -> &'static libloading::Library {
     static LIBRARY: OnceLock<libloading::Library> = OnceLock::new();
-    LIBRARY.get_or_init(|| {
-        let path = plugin_path();
-        assert!(path.exists(), "{} not built", path.display());
-        unsafe { libloading::Library::new(&path).unwrap() }
-    })
+    LIBRARY.get_or_init(|| unsafe { libloading::Library::new(&plugin().binary).unwrap() })
 }
 
 unsafe fn entry() -> &'static clap_plugin_entry {
@@ -148,7 +148,7 @@ static HOST: clap_host = clap_host {
 unsafe fn create() -> *const clap_plugin {
     unsafe {
         let entry = entry();
-        let path = CString::new(plugin_path().to_str().unwrap()).unwrap();
+        let path = CString::new(plugin().path.to_str().unwrap()).unwrap();
         assert!((entry.init.unwrap())(path.as_ptr()));
         let factory = (entry.get_factory.unwrap())(CLAP_PLUGIN_FACTORY_ID.as_ptr()) as *const clap_plugin_factory;
         let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
@@ -546,6 +546,7 @@ fn the_gui_offers_an_embedded_native_window_of_fixed_size() {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn the_gui_takes_the_hosts_scale_and_reports_its_size_in_it() {
     let _turn = turn();
@@ -571,6 +572,23 @@ fn the_gui_takes_the_hosts_scale_and_reports_its_size_in_it() {
         (gui.destroy.unwrap())(plugin);
         assert!((gui.create.unwrap())(plugin, NATIVE_API.as_ptr(), false));
         assert_eq!(size(), (200, 100), "a new gui starts at 1.0 until the host says otherwise");
+        ((*plugin).destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_gui_measures_in_points_and_takes_no_scale_from_the_host() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let gui: &clap_plugin_gui = extension(plugin, CLAP_EXT_GUI);
+        assert!((gui.create.unwrap())(plugin, NATIVE_API.as_ptr(), false));
+        assert!(!(gui.set_scale.unwrap())(plugin, 2.0));
+        let (mut width, mut height) = (0, 0);
+        assert!((gui.get_size.unwrap())(plugin, &mut width, &mut height));
+        assert_eq!((width, height), (200, 100));
         ((*plugin).destroy.unwrap())(plugin);
         (entry().deinit.unwrap())();
     }

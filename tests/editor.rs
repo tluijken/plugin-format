@@ -1,5 +1,6 @@
 //! Opens the editor in a real window as a CLAP host does, again and again. Needs a display: on
 //! Linux an X server such as Xvfb, else the test is skipped; in CI (`CI` set) it fails instead.
+//! Runs on the main thread, without the test harness, as AppKit requires.
 
 use std::ptr;
 use std::sync::Arc;
@@ -198,6 +199,61 @@ mod platform {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod platform {
+    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask, NSWindow, NSWindowStyleMask};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
+
+    use super::*;
+
+    pub const API: &std::ffi::CStr = clap_sys::ext::gui::CLAP_WINDOW_API_COCOA;
+
+    /// The host's window the editor is embedded in. On screen, though without a border or a place in
+    /// the Dock: AppKit draws a view only in a window that is.
+    pub struct Parent(Retained<NSWindow>);
+
+    impl Parent {
+        /// `None` off the main thread, where AppKit opens no window.
+        pub fn new() -> Option<Self> {
+            let mtm = MainThreadMarker::new()?;
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            app.finishLaunching();
+            let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1200.0, 800.0));
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), rect, NSWindowStyleMask::Borderless, NSBackingStoreType::Buffered, false)
+            };
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.orderFrontRegardless();
+            Some(Parent(window))
+        }
+
+        pub fn handle(&self) -> clap_window_handle {
+            let view = self.0.contentView().expect("a content view");
+            clap_window_handle { cocoa: Retained::as_ptr(&view) as *mut std::ffi::c_void }
+        }
+    }
+
+    impl Drop for Parent {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    /// The window runs on this thread, as on the host's main thread. Waits a moment for the first
+    /// event, so the run loop also gets to draw what needs drawing before it would wait.
+    pub fn pump() {
+        let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+        let mut until = NSDate::dateWithTimeIntervalSinceNow(0.001);
+        while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(NSEventMask::Any, Some(&until), unsafe { NSDefaultRunLoopMode }, true) {
+            app.sendEvent(&event);
+            until = NSDate::distantPast();
+        }
+    }
+}
+
 /// Lets the window run until `done`, or fails after a while.
 fn wait_for(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -228,7 +284,25 @@ unsafe fn open_and_close(plugin: *const clap_plugin, gui: &clap_plugin_gui, pare
     }
 }
 
-#[test]
+fn main() {
+    editor_opens_and_closes_fifty_times();
+}
+
+/// The thread count once it holds still: a closed window's thread may still be on its way out.
+#[cfg(not(target_os = "macos"))]
+fn settled() -> usize {
+    let mut count = platform::threads();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        platform::pump();
+        let now = platform::threads();
+        if now == count {
+            return count;
+        }
+        count = now;
+    }
+}
+
 fn editor_opens_and_closes_fifty_times() {
     let Some(parent) = platform::Parent::new() else {
         assert!(std::env::var_os("CI").is_none(), "no display to open the editor on");
@@ -258,14 +332,20 @@ fn editor_opens_and_closes_fifty_times() {
 
         // Whatever the first window starts once for the whole process, e.g. in the GL driver.
         open_and_close(plugin, gui, &parent, 300);
-        let before = platform::threads();
+        #[cfg(not(target_os = "macos"))]
+        let before = settled();
         for round in 0..50 {
             open_and_close(plugin, gui, &parent, 300 + round);
         }
-        wait_for("thread exit", || platform::threads() <= before);
-        assert_eq!(platform::threads(), before);
+        // On macOS the window runs on this thread, and the system's worker threads come and go.
+        #[cfg(not(target_os = "macos"))]
+        {
+            wait_for("thread exit", || platform::threads() <= before);
+            assert_eq!(platform::threads(), before);
+        }
 
         ((*plugin).destroy.unwrap())(plugin);
         (entry.deinit.unwrap())();
     }
+    println!("test editor_opens_and_closes_fifty_times ... ok");
 }

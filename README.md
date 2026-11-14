@@ -19,6 +19,15 @@ nix develop -c cargo test --workspace
 nix develop .#windows -c cargo test --target x86_64-pc-windows-gnu   # MinGW cross build, tests under Wine
 ```
 
+`scripts/bundle.sh <crate> <name> <bundle identifier> <output dir>` builds a plugin in release and lays
+it out as hosts look for it: `<name>.clap` and `<name>.vst3` for this system (on macOS universal,
+signed ad hoc bundles), or for the Linux or Windows target in `CARGO_BUILD_TARGET`:
+
+```sh
+nix develop -c scripts/bundle.sh gain Gain com.example.gain bundles
+nix develop .#windows -c scripts/bundle.sh gain Gain com.example.gain bundles
+```
+
 ## Licence
 
 MIT OR Apache-2.0, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.

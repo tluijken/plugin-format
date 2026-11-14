@@ -1,9 +1,8 @@
 //! Loads the sidechain example's CLAP library and checks what a host gives the plugin besides the main input.
 
 use std::ffi::{CStr, CString};
-use std::path::PathBuf;
 use std::ptr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
@@ -19,10 +18,11 @@ use clap_sys::process::clap_process;
 use clap_sys::version::CLAP_VERSION;
 use sidechain::POSITION;
 
-fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let name = if cfg!(windows) { "sidechain.dll" } else { "libsidechain.so" };
-    exe.parent().unwrap().join(name)
+mod built;
+
+fn plugin() -> &'static built::Built {
+    static PLUGIN: OnceLock<built::Built> = OnceLock::new();
+    PLUGIN.get_or_init(|| built::plugin("sidechain", "clap"))
 }
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -49,7 +49,7 @@ static HOST: clap_host = clap_host {
 /// The library stays loaded for the whole run, as it would in a host.
 unsafe fn entry() -> &'static clap_plugin_entry {
     unsafe {
-        let library = Box::leak(Box::new(libloading::Library::new(plugin_path()).expect("sidechain not built")));
+        let library = Box::leak(Box::new(libloading::Library::new(&plugin().binary).unwrap()));
         let entry: libloading::Symbol<*const clap_plugin_entry> = library.get(b"clap_entry\0").unwrap();
         &**entry
     }
@@ -59,7 +59,7 @@ unsafe fn entry() -> &'static clap_plugin_entry {
 unsafe fn active() -> *const clap_plugin {
     unsafe {
         let entry = entry();
-        let path = CString::new(plugin_path().to_str().unwrap()).unwrap();
+        let path = CString::new(plugin().path.to_str().unwrap()).unwrap();
         assert!((entry.init.unwrap())(path.as_ptr()));
         let factory = (entry.get_factory.unwrap())(CLAP_PLUGIN_FACTORY_ID.as_ptr()) as *const clap_plugin_factory;
         let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);

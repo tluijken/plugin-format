@@ -4,7 +4,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_void};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -18,15 +17,14 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
-fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let name = if cfg!(windows) { "gain.dll" } else { "libgain.so" };
-    exe.parent().unwrap().join(name)
-}
+mod built;
+mod vst3_module;
 
 #[cfg(windows)]
 const NATIVE_VIEW: FIDString = kPlatformTypeHWND;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const NATIVE_VIEW: FIDString = kPlatformTypeNSView;
+#[cfg(not(any(windows, target_os = "macos")))]
 const NATIVE_VIEW: FIDString = kPlatformTypeX11EmbedWindowID;
 #[cfg(windows)]
 const OTHER_VIEW: FIDString = kPlatformTypeX11EmbedWindowID;
@@ -42,24 +40,7 @@ fn turn() -> MutexGuard<'static, ()> {
 
 fn library() -> &'static libloading::Library {
     static LIBRARY: OnceLock<libloading::Library> = OnceLock::new();
-    LIBRARY.get_or_init(|| {
-        let path = plugin_path();
-        assert!(path.exists(), "{} not built", path.display());
-        unsafe {
-            let library = libloading::Library::new(&path).unwrap();
-            #[cfg(windows)]
-            {
-                let entry: libloading::Symbol<extern "system" fn() -> bool> = library.get(b"InitDll\0").unwrap();
-                assert!(entry());
-            }
-            #[cfg(not(windows))]
-            {
-                let entry: libloading::Symbol<extern "system" fn(*mut c_void) -> bool> = library.get(b"ModuleEntry\0").unwrap();
-                assert!(entry(ptr::null_mut()));
-            }
-            library
-        }
-    })
+    LIBRARY.get_or_init(|| vst3_module::load(&built::plugin("gain", "vst3")))
 }
 
 fn factory() -> ComPtr<IPluginFactory> {
@@ -551,6 +532,7 @@ fn size(editor: &ComPtr<IPlugView>) -> (i32, i32) {
     (rect.right - rect.left, rect.bottom - rect.top)
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn the_view_takes_the_hosts_content_scale_and_reports_its_size_in_it() {
     let _turn = turn();
@@ -570,6 +552,20 @@ fn the_view_takes_the_hosts_content_scale_and_reports_its_size_in_it() {
         assert_eq!(scaling.setContentScaleFactor(f32::INFINITY), kResultFalse);
         assert_eq!(size(&editor), (300, 150), "a factor that cannot be applied is ignored");
         assert_eq!(scaling.setContentScaleFactor(1.0), kResultTrue);
+        assert_eq!(size(&editor), (200, 100));
+        drop(plugin);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_view_measures_in_points_and_takes_no_content_scale_from_the_host() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let editor = view(&plugin.controller, c"editor").expect("an editor view");
+        let scaling = editor.cast::<IPlugViewContentScaleSupport>().expect("content scale support");
+        assert_eq!(scaling.setContentScaleFactor(2.0), kResultFalse);
         assert_eq!(size(&editor), (200, 100));
         drop(plugin);
     }

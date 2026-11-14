@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -27,11 +27,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The bundle is universal: both architectures, whichever the runner is.
+      - name: macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy for Intel macOS
+        if: runner.os == 'macOS'
+        run: cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
       - name: Test
         if: runner.os != 'Linux'
         run: cargo test --workspace --no-fail-fast
@@ -39,3 +46,9 @@ jobs:
       - name: Test under Xvfb
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo test --workspace --no-fail-fast
+      - name: Bundle
+        shell: bash
+        run: |
+          scripts/bundle.sh gain Gain com.plugin-format.gain bundles
+          scripts/bundle.sh sidechain Sidechain com.plugin-format.sidechain bundles
+          find bundles

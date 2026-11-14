@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"];
+const TARGETS: [&str; 4] = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
 
 /// Packages that declare only `license_file`, each checked by hand.
 const LICENCE_FILE_ALLOW: &[(&str, &str)] = &[];

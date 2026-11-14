@@ -811,7 +811,9 @@ impl<P: Plugin> IEditControllerTrait for Component<P> {
 const PLATFORM_TYPE: &CStr = c"X11EmbedWindowID";
 #[cfg(target_os = "windows")]
 const PLATFORM_TYPE: &CStr = c"HWND";
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+const PLATFORM_TYPE: &CStr = c"NSView";
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 const PLATFORM_TYPE: &CStr = c"";
 
 fn platform_type_supported(kind: FIDString) -> bool {
@@ -857,18 +859,22 @@ impl<P: Plugin> View<P> {
         }
         let Ok(mut window) = self.window.try_lock() else { return kResultFalse };
         *window = None;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = {
             let (host, sizing) = (self.host.clone(), self.sizing.clone());
+            #[cfg(target_os = "windows")]
+            let parent = Parent::Win32(parent);
+            #[cfg(target_os = "macos")]
+            let parent = Parent::AppKit(parent);
             (
-                Parent::Win32(parent),
+                parent,
                 Box::new(move || {
                     host.tick();
                     sizing.tick();
                 }),
             )
         };
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = (Parent::X11(parent as usize as std::ffi::c_ulong), Box::new(|| {}));
         *window = editor::open(parent, self.sizing.geometry.clone(), self.shared.editor(self.host.cx.clone()), on_frame);
         if window.is_none() {
@@ -1089,7 +1095,7 @@ impl<P: Plugin> IPlugViewContentScaleSupportTrait for View<P> {
         guard(kInternalError, || {
             let geometry = &self.sizing.geometry;
             let before = geometry.physical();
-            if !geometry.set_scale(factor as f64) {
+            if !editor::HOST_SCALE || !geometry.set_scale(factor as f64) {
                 return kResultFalse;
             }
             let open = self.window.try_lock().is_ok_and(|window| window.is_some());
@@ -1593,6 +1599,7 @@ mod tests {
         (rect.right - rect.left, rect.bottom - rect.top)
     }
 
+    #[cfg_attr(target_os = "macos", ignore = "macOS takes no scale from the host")]
     #[test]
     fn vst3_check_size_constraint_clamps() {
         unsafe {

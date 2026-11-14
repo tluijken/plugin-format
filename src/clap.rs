@@ -762,9 +762,13 @@ impl<P: Plugin> Instance<P> {
         self.cx.disconnect_resize();
     }
 
-    /// X11 and Win32 sizes are physical pixels, so the scale applies to both.
+    /// X11 and Win32 sizes are physical pixels, so the scale applies to both. Cocoa's are points, for
+    /// which CLAP has the host not set one.
     unsafe extern "C" fn gui_set_scale(plugin: *const clap_plugin, scale: f64) -> bool {
         Self::with(plugin, || false, |instance| {
+            if !editor::HOST_SCALE {
+                return false;
+            }
             let Ok(gui) = instance.gui.try_lock() else { return false };
             let before = gui.geometry.physical();
             if !gui.geometry.set_scale(scale) {
@@ -857,7 +861,9 @@ impl<P: Plugin> Instance<P> {
             }
             #[cfg(target_os = "windows")]
             let parent = Parent::Win32(unsafe { window.specific.win32 });
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            let parent = Parent::AppKit(unsafe { window.specific.cocoa });
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             let parent = Parent::X11(unsafe { window.specific.x11 });
             instance.close(&mut gui);
             gui.window = editor::open(parent, gui.geometry.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
@@ -912,7 +918,9 @@ fn port_type(channels: u32) -> *const c_char {
 const NATIVE_API: Option<&CStr> = Some(clap_sys::ext::gui::CLAP_WINDOW_API_X11);
 #[cfg(target_os = "windows")]
 const NATIVE_API: Option<&CStr> = Some(clap_sys::ext::gui::CLAP_WINDOW_API_WIN32);
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+const NATIVE_API: Option<&CStr> = Some(clap_sys::ext::gui::CLAP_WINDOW_API_COCOA);
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 const NATIVE_API: Option<&CStr> = None;
 
 fn supported(api: *const c_char, floating: bool) -> bool {
@@ -1245,6 +1253,7 @@ mod tests {
         (width, height)
     }
 
+    #[cfg_attr(target_os = "macos", ignore = "macOS takes no scale from the host")]
     #[test]
     fn adjust_size_respects_the_minimum() {
         let host = sized_host();
@@ -1286,6 +1295,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(target_os = "macos", ignore = "macOS takes no scale from the host")]
     #[test]
     fn the_editor_asks_the_host_for_a_size_no_smaller_than_its_minimum() {
         let host = sized_host();

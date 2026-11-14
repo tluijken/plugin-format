@@ -48,7 +48,7 @@ pub trait Shared: Send + Sync + 'static {
     fn save(&self) -> Vec<u8>;
     fn load(&self, bytes: &[u8]) -> bool;
     /// A new one for every window the host opens. The window's thread calls it with the root `Ui` for
-    /// every frame while the window is open: on Linux a thread of its own, on Windows the host's UI thread.
+    /// every frame while the window is open: on Linux a thread of its own, on Windows and macOS the host's UI thread.
     /// `cx` is the instance's, the same one `attach` was given.
     fn editor(&self, cx: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send>;
     /// Called once the host is known, before any window opens, and again should a VST3 host replace
@@ -134,6 +134,18 @@ macro_rules! export_vst3 {
         #[cfg(target_os = "windows")]
         #[unsafe(no_mangle)]
         pub extern "system" fn ExitDll() -> bool {
+            true
+        }
+
+        #[cfg(target_os = "macos")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn bundleEntry(_: *mut ::core::ffi::c_void) -> bool {
+            true
+        }
+
+        #[cfg(target_os = "macos")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn bundleExit() -> bool {
             true
         }
     };

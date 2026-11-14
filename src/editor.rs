@@ -14,8 +14,9 @@ use crate::{Plugin, Shared};
 /// The editor's size and the host's scale factor, shared by the format's view and the window.
 ///
 /// The size is at a scale of 1.0 and changes only for a resizable editor, never to below its
-/// minimum. The scale is the host's, 1.0 until it gives one. The scale the system reports to the
-/// window is never used, since the host would not know the size that gives the window.
+/// minimum. The scale is the host's, 1.0 until it gives one. On Linux and Windows the scale the
+/// system reports to the window is never used, since the host would not know the size that gives
+/// the window. On macOS sizes are in points, which the system draws at the screen's backing scale.
 ///
 /// When either changes while the window is open, the window follows on its next frame by resizing
 /// itself, and the parent is resized to match by the host or at the format's request: that keeps the
@@ -145,7 +146,14 @@ pub enum Parent {
     X11(std::ffi::c_ulong),
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Win32(*mut c_void),
+    /// An `NSView`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    AppKit(*mut c_void),
 }
+
+/// Whether a host's scale applies: not on macOS, where CLAP and VST3 hosts measure in points and
+/// leave the backing scale to the system.
+pub const HOST_SCALE: bool = !cfg!(target_os = "macos");
 
 /// The open editor, closed when dropped. Not `Send`, so it is closed on the thread that opened it,
 /// which Windows requires of a window.
@@ -176,9 +184,10 @@ impl Drop for Window {
     }
 }
 
-/// Opens at `geometry`'s size, in the platform's pixels as CLAP and VST3 hosts measure the parent on
-/// Linux and Windows. `on_frame` runs before `ui` on the window's thread. `None` when the parent is
-/// no window of this platform or the window cannot be opened, e.g. without a display.
+/// Opens at `geometry`'s size, in the platform's pixels as CLAP and VST3 hosts measure the parent:
+/// physical pixels on Linux and Windows, points on macOS. `on_frame` runs before `ui` on the window's
+/// thread. `None` when the parent is no window of this platform or the window cannot be opened, e.g.
+/// without a display.
 pub fn open(parent: Parent, geometry: Geometry, ui: Box<dyn FnMut(&mut egui::Ui) + Send>, on_frame: Box<dyn FnMut() + Send>) -> Option<Window> {
     let parent = Handle(raw(parent)?);
     let (width, height) = geometry.physical();
@@ -216,6 +225,8 @@ fn raw(parent: Parent) -> Option<RawWindowHandle> {
         }
         #[cfg(target_os = "windows")]
         Parent::Win32(hwnd) => Some(raw_window_handle::Win32WindowHandle::new(std::num::NonZeroIsize::new(hwnd as isize)?).into()),
+        #[cfg(target_os = "macos")]
+        Parent::AppKit(view) => Some(raw_window_handle::AppKitWindowHandle::new(std::ptr::NonNull::new(view)?).into()),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -258,7 +269,8 @@ impl App for Editor {
 }
 
 /// Keeps the window at the editor's size times the host's scale, drawn at that scale, whatever scale
-/// the system reports to the window: egui's zoom makes up the difference.
+/// the system reports to the window: egui's zoom makes up the difference. On macOS, where the window
+/// is measured in points, it draws at the system's scale instead.
 struct Fit {
     geometry: Geometry,
     /// The zoom egui-baseview last saw. It answers a change of zoom by resizing the window by the
@@ -275,7 +287,7 @@ impl Fit {
     }
 
     fn zoom(&self, system: f32) -> f32 {
-        self.geometry.scale() as f32 / system
+        if cfg!(target_os = "macos") { self.geometry.scale() as f32 } else { self.geometry.scale() as f32 / system }
     }
 
     /// A zoom set here takes effect from the next pass.
@@ -415,6 +427,7 @@ mod tests {
         (size.x.round() as u32, size.y.round() as u32)
     }
 
+    #[cfg_attr(target_os = "macos", ignore = "macOS draws at the system's scale")]
     #[test]
     fn the_window_draws_at_the_hosts_scale_whatever_scale_the_system_reports() {
         let ctx = egui::Context::default();
@@ -436,6 +449,20 @@ mod tests {
         assert_eq!(pass(&ctx, &mut fit, 1.25), vec![vec2(380.0, 220.0)], "the system's scale changed under the window");
         assert_eq!(ctx.pixels_per_point(), 1.0);
         assert_eq!(physical(vec2(380.0, 220.0), ctx.zoom_factor(), 1.25), (380, 220));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_window_draws_at_the_systems_scale_in_points() {
+        let ctx = egui::Context::default();
+        let mut fit = Fit::new(fixed((380, 220)), 1.0);
+
+        assert_eq!(pass(&ctx, &mut fit, 2.0), vec![]);
+        assert_eq!(ctx.pixels_per_point(), 2.0);
+        assert_eq!(ctx.zoom_factor(), 1.0, "a window of the editor's size in points");
+
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![], "the window moved to a screen of another scale");
+        assert_eq!(ctx.pixels_per_point(), 1.0);
     }
 
     #[test]
