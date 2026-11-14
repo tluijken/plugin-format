@@ -1,6 +1,7 @@
 use core::ffi::CStr;
 
 pub mod clap;
+mod editor;
 mod param;
 pub mod vst3;
 
@@ -29,8 +30,9 @@ pub trait Shared: Send + Sync + 'static {
     fn param_from_text(&self, id: u32, text: &str) -> Option<f64>;
     fn save(&self) -> Vec<u8>;
     fn load(&self, bytes: &[u8]) -> bool;
-    /// Called on the GUI thread for every frame while the window is open.
-    fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send>;
+    /// A new one for every window the host opens. The window's thread calls it with the root `Ui` for
+    /// every frame while the window is open: on Linux a thread of its own, on Windows the host's UI thread.
+    fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send>;
 }
 
 /// The audio half, which the wrapper only ever uses from one thread at a time.

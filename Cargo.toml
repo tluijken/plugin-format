@@ -6,5 +6,9 @@ publish.workspace = true
 
 [dependencies]
 clap-sys = "0.5"
+# The same egui egui-baseview renders with, for the default fonts egui-baseview leaves out.
 egui = "0.37"
+# "log" because 0.9 does not build without a logging feature.
+egui-baseview = { version = "0.9", default-features = false, features = ["opengl", "log"] }
+raw-window-handle = "0.6"
 vst3 = "0.3"

@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 #[doc(hidden)]
@@ -24,6 +24,7 @@ use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_ERROR, clap_process,
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
+use crate::editor::{self, Parent};
 use crate::{Plugin, Shared, copy_str, guard, process_block};
 
 fn same(a: *const c_char, b: &CStr) -> bool {
@@ -126,6 +127,7 @@ struct Instance<P: Plugin> {
     /// inside `host_latency.changed()` while `activate` still holds the processor.
     latency: AtomicU32,
     host_latency: AtomicPtr<clap_host_latency>,
+    gui: Mutex<Gui>,
 }
 
 impl<P: Plugin> Instance<P> {
@@ -154,6 +156,7 @@ impl<P: Plugin> Instance<P> {
             inputs: AtomicU32::new(1),
             latency: AtomicU32::new(latency),
             host_latency: AtomicPtr::new(ptr::null_mut()),
+            gui: Mutex::default(),
         }));
         unsafe {
             (*instance).clap.plugin_data = instance as *mut c_void;
@@ -550,22 +553,121 @@ impl<P: Plugin> Instance<P> {
     }
 
     const GUI: clap_plugin_gui = clap_plugin_gui {
-        is_api_supported: Some(gui::is_api_supported),
-        get_preferred_api: Some(gui::get_preferred_api),
-        create: Some(gui::create),
-        destroy: Some(gui::destroy),
-        set_scale: Some(gui::set_scale),
-        get_size: Some(gui::get_size),
-        can_resize: Some(gui::unsupported),
-        get_resize_hints: Some(gui::get_resize_hints),
-        adjust_size: Some(gui::get_size),
-        set_size: Some(gui::set_size),
-        set_parent: Some(gui::set_window),
-        set_transient: Some(gui::set_window),
-        suggest_title: Some(gui::suggest_title),
-        show: Some(gui::unsupported),
-        hide: Some(gui::unsupported),
+        is_api_supported: Some(Self::gui_supported),
+        get_preferred_api: Some(Self::gui_preferred_api),
+        create: Some(Self::gui_create),
+        destroy: Some(Self::gui_destroy),
+        set_scale: Some(Self::gui_set_scale),
+        get_size: Some(Self::gui_size),
+        can_resize: Some(Self::gui_can_resize),
+        get_resize_hints: Some(Self::gui_resize_hints),
+        adjust_size: Some(Self::gui_size),
+        set_size: Some(Self::gui_set_size),
+        set_parent: Some(Self::gui_set_parent),
+        set_transient: Some(Self::gui_set_transient),
+        suggest_title: Some(Self::gui_suggest_title),
+        show: Some(Self::gui_show),
+        hide: Some(Self::gui_hide),
     };
+
+    /// A call that overlaps another, against CLAP's main-thread rule, gets `failed` rather than wait.
+    fn with_gui<R>(plugin: *const clap_plugin, failed: impl FnOnce() -> R, body: impl FnOnce(&mut Gui) -> R) -> R {
+        Self::with(plugin, || None, |instance| instance.gui.try_lock().ok().map(|mut gui| body(&mut gui))).unwrap_or_else(failed)
+    }
+
+    unsafe extern "C" fn gui_supported(_: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
+        guard(false, || supported(api, floating))
+    }
+
+    unsafe extern "C" fn gui_preferred_api(_: *const clap_plugin, api: *mut *const c_char, floating: *mut bool) -> bool {
+        guard(false, || {
+            let Some(native) = NATIVE_API else { return false };
+            if api.is_null() || floating.is_null() {
+                return false;
+            }
+            unsafe {
+                api.write(native.as_ptr());
+                floating.write(false);
+            }
+            true
+        })
+    }
+
+    unsafe extern "C" fn gui_create(plugin: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
+        Self::with_gui(plugin, || false, |gui| {
+            if !supported(api, floating) {
+                return false;
+            }
+            *gui = Gui { created: true, window: None };
+            true
+        })
+    }
+
+    unsafe extern "C" fn gui_destroy(plugin: *const clap_plugin) {
+        Self::with_gui(plugin, || (), |gui| *gui = Gui::default())
+    }
+
+    /// The window reads the scale from the system.
+    unsafe extern "C" fn gui_set_scale(_: *const clap_plugin, _: f64) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn gui_size(_: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
+        guard(false, || {
+            if width.is_null() || height.is_null() {
+                return false;
+            }
+            unsafe {
+                width.write(P::EDITOR_SIZE.0);
+                height.write(P::EDITOR_SIZE.1);
+            }
+            true
+        })
+    }
+
+    unsafe extern "C" fn gui_can_resize(_: *const clap_plugin) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn gui_resize_hints(_: *const clap_plugin, _: *mut clap_gui_resize_hints) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn gui_set_size(_: *const clap_plugin, width: u32, height: u32) -> bool {
+        (width, height) == P::EDITOR_SIZE
+    }
+
+    unsafe extern "C" fn gui_set_parent(plugin: *const clap_plugin, window: *const clap_window) -> bool {
+        Self::with(plugin, || false, |instance| {
+            let Ok(mut gui) = instance.gui.try_lock() else { return false };
+            let Some(window) = (unsafe { window.as_ref() }) else { return false };
+            if !gui.created || !supported(window.api, false) {
+                return false;
+            }
+            #[cfg(target_os = "windows")]
+            let parent = Parent::Win32(unsafe { window.specific.win32 });
+            #[cfg(not(target_os = "windows"))]
+            let parent = Parent::X11(unsafe { window.specific.x11 });
+            gui.window = None;
+            gui.window = editor::open(parent, P::EDITOR_SIZE, instance.shared.editor(), Box::new(|| {}));
+            gui.window.is_some()
+        })
+    }
+
+    /// Embedded only, so there is no floating window to keep above the host's.
+    unsafe extern "C" fn gui_set_transient(_: *const clap_plugin, _: *const clap_window) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn gui_suggest_title(_: *const clap_plugin, _: *const c_char) {}
+
+    unsafe extern "C" fn gui_show(plugin: *const clap_plugin) -> bool {
+        Self::with_gui(plugin, || false, |gui| gui.window.as_ref().is_some_and(editor::Window::show))
+    }
+
+    unsafe extern "C" fn gui_hide(plugin: *const clap_plugin) -> bool {
+        Self::with_gui(plugin, || false, |gui| gui.window.as_ref().is_some_and(editor::Window::hide))
+    }
 }
 
 /// Config id is the index; the second field is the main input's channel count.
@@ -575,38 +677,22 @@ fn port_type(channels: u32) -> *const c_char {
     if channels == 1 { CLAP_PORT_MONO.as_ptr() } else { CLAP_PORT_STEREO.as_ptr() }
 }
 
-mod gui {
-    use super::*;
+#[cfg(target_os = "linux")]
+const NATIVE_API: Option<&CStr> = Some(clap_sys::ext::gui::CLAP_WINDOW_API_X11);
+#[cfg(target_os = "windows")]
+const NATIVE_API: Option<&CStr> = Some(clap_sys::ext::gui::CLAP_WINDOW_API_WIN32);
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const NATIVE_API: Option<&CStr> = None;
 
-    pub unsafe extern "C" fn is_api_supported(_: *const clap_plugin, _: *const c_char, _: bool) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn get_preferred_api(_: *const clap_plugin, _: *mut *const c_char, _: *mut bool) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn create(_: *const clap_plugin, _: *const c_char, _: bool) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn destroy(_: *const clap_plugin) {}
-    pub unsafe extern "C" fn set_scale(_: *const clap_plugin, _: f64) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn get_size(_: *const clap_plugin, _: *mut u32, _: *mut u32) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn unsupported(_: *const clap_plugin) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn get_resize_hints(_: *const clap_plugin, _: *mut clap_gui_resize_hints) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn set_size(_: *const clap_plugin, _: u32, _: u32) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn set_window(_: *const clap_plugin, _: *const clap_window) -> bool {
-        false
-    }
-    pub unsafe extern "C" fn suggest_title(_: *const clap_plugin, _: *const c_char) {}
+fn supported(api: *const c_char, floating: bool) -> bool {
+    !floating && NATIVE_API.is_some_and(|native| same(api, native))
+}
+
+/// Only the main thread uses it, as CLAP requires of every gui call.
+#[derive(Default)]
+struct Gui {
+    created: bool,
+    window: Option<editor::Window>,
 }
 
 #[cfg(test)]
@@ -641,7 +727,7 @@ mod tests {
         fn load(&self, _: &[u8]) -> bool {
             true
         }
-        fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send> {
+        fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
             Box::new(|_| {})
         }
     }

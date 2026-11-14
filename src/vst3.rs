@@ -15,7 +15,10 @@ use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
+#[cfg(target_os = "linux")]
+use vst3::Steinberg::Linux::IRunLoopTrait;
 
+use crate::editor::{self, Parent};
 use crate::{Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
 
 const CATEGORY: &str = "Audio Module Class";
@@ -182,12 +185,35 @@ struct Component<P: Plugin> {
     sample_rate: AtomicU64,
     /// 0 until `setupProcessing`.
     max_block: AtomicU32,
+    host: Arc<Host>,
+}
+
+/// What the component tells the host, shared with its views so that a view the host keeps after
+/// releasing the component still has something valid to announce through.
+struct Host {
     /// What `getLatencySamples` reports. It never reads `plugin`, so a host may ask at any time.
     latency: AtomicU32,
-    /// Left by `process` for the next main-thread call to announce, since `process` may not call the host's handler.
+    /// Left by `process` for a call on the host's UI thread to announce, since Steinberg requires
+    /// `restartComponent` there: `setActive(false)` or the open editor's timer.
     new_latency: AtomicU32,
     latency_changed: AtomicBool,
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
+}
+
+impl Host {
+    fn restart(&self, flags: RestartFlags) {
+        let handler = self.handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(handler) = handler {
+            unsafe { handler.restartComponent(flags) };
+        }
+    }
+
+    fn announce_latency(&self) {
+        if self.latency_changed.swap(false, Ordering::AcqRel) {
+            self.latency.store(self.new_latency.load(Ordering::Acquire), Ordering::Release);
+            self.restart(kLatencyChanged);
+        }
+    }
 }
 
 impl<P: Plugin> Class for Component<P> {
@@ -216,10 +242,12 @@ impl<P: Plugin> Component<P> {
             inputs: AtomicU32::new(1),
             sample_rate: AtomicU64::new(0),
             max_block: AtomicU32::new(0),
-            latency: AtomicU32::new(latency),
-            new_latency: AtomicU32::new(latency),
-            latency_changed: AtomicBool::new(false),
-            handler: Mutex::new(None),
+            host: Arc::new(Host {
+                latency: AtomicU32::new(latency),
+                new_latency: AtomicU32::new(latency),
+                latency_changed: AtomicBool::new(false),
+                handler: Mutex::new(None),
+            }),
         }
     }
 
@@ -240,20 +268,6 @@ impl<P: Plugin> Component<P> {
         self.shared.params().iter().find(|p| p.id == id)
     }
 
-    fn restart(&self, flags: RestartFlags) {
-        let handler = self.handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(handler) = handler {
-            unsafe { handler.restartComponent(flags) };
-        }
-    }
-
-    fn announce_latency(&self) {
-        if self.latency_changed.swap(false, Ordering::AcqRel) {
-            self.latency.store(self.new_latency.load(Ordering::Acquire), Ordering::Release);
-            self.restart(kLatencyChanged);
-        }
-    }
-
     fn set_active(&self, active: bool) -> tresult {
         if active == self.active.load(Ordering::Acquire) {
             return kResultOk;
@@ -272,8 +286,8 @@ impl<P: Plugin> Component<P> {
             }) else {
                 return kResultFalse;
             };
-            if self.latency.swap(latency, Ordering::AcqRel) != latency {
-                self.restart(kLatencyChanged);
+            if self.host.latency.swap(latency, Ordering::AcqRel) != latency {
+                self.host.restart(kLatencyChanged);
             }
         } else {
             let deactivated = self.claim(|plugin| {
@@ -283,7 +297,7 @@ impl<P: Plugin> Component<P> {
             if deactivated.is_none() {
                 return kResultFalse;
             }
-            self.announce_latency();
+            self.host.announce_latency();
         }
         kResultOk
     }
@@ -353,8 +367,8 @@ impl<P: Plugin> Component<P> {
                 }
                 process_block(plugin, frames, &outs[..count], &ins[..inputs], configured);
                 if plugin.take_latency_changed() {
-                    self.new_latency.store(plugin.latency(), Ordering::Release);
-                    self.latency_changed.store(true, Ordering::Release);
+                    self.host.new_latency.store(plugin.latency(), Ordering::Release);
+                    self.host.latency_changed.store(true, Ordering::Release);
                 }
                 kResultOk
             });
@@ -363,7 +377,6 @@ impl<P: Plugin> Component<P> {
     }
 
     fn save_state(&self, state: *mut IBStream) -> tresult {
-        self.announce_latency();
         unsafe {
             let Some(stream) = ComRef::from_raw(state) else { return kInvalidArgument };
             let bytes = self.shared.save();
@@ -398,7 +411,7 @@ impl<P: Plugin> Component<P> {
                 return kResultFalse;
             }
         }
-        self.restart(kParamValuesChanged);
+        self.host.restart(kParamValuesChanged);
         kResultOk
     }
 }
@@ -410,7 +423,7 @@ impl<P: Plugin> IPluginBaseTrait for Component<P> {
 
     unsafe fn terminate(&self) -> tresult {
         guard(kInternalError, || {
-            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self.host.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
             kResultOk
         })
     }
@@ -512,7 +525,7 @@ impl<P: Plugin> IAudioProcessorTrait for Component<P> {
     }
 
     unsafe fn getLatencySamples(&self) -> uint32 {
-        self.latency.load(Ordering::Acquire)
+        self.host.latency.load(Ordering::Acquire)
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
@@ -640,13 +653,213 @@ impl<P: Plugin> IEditControllerTrait for Component<P> {
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
         guard(kInternalError, || {
             let handler = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr());
-            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = handler;
+            *self.host.handler.lock().unwrap_or_else(|e| e.into_inner()) = handler;
             kResultOk
         })
     }
 
-    unsafe fn createView(&self, _name: FIDString) -> *mut IPlugView {
-        ptr::null_mut()
+    unsafe fn createView(&self, name: FIDString) -> *mut IPlugView {
+        guard(ptr::null_mut(), || {
+            if name.is_null() || unsafe { CStr::from_ptr(name) } != c"editor" {
+                return ptr::null_mut();
+            }
+            ComWrapper::new(View::<P>::new(self)).to_com_ptr::<IPlugView>().map_or(ptr::null_mut(), ComPtr::into_raw)
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+const PLATFORM_TYPE: &CStr = c"X11EmbedWindowID";
+#[cfg(target_os = "windows")]
+const PLATFORM_TYPE: &CStr = c"HWND";
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const PLATFORM_TYPE: &CStr = c"";
+
+fn platform_type_supported(kind: FIDString) -> bool {
+    !kind.is_null() && !PLATFORM_TYPE.is_empty() && unsafe { CStr::from_ptr(kind) } == PLATFORM_TYPE
+}
+
+/// The editor window. It holds no reference to the component, only to what the editor and the
+/// latency announcement need, so the host may release the two in either order. Steinberg calls every
+/// `IPlugView` method on the host's UI thread, which is also where `window` opens and closes.
+struct View<P: Plugin> {
+    shared: Arc<P::Shared>,
+    host: Arc<Host>,
+    #[cfg(target_os = "linux")]
+    timer: Mutex<Option<Timer>>,
+    window: Mutex<Option<editor::Window>>,
+    frame: Mutex<Option<ComPtr<IPlugFrame>>>,
+}
+
+impl<P: Plugin> Class for View<P> {
+    type Interfaces = (IPlugView,);
+}
+
+impl<P: Plugin> View<P> {
+    fn new(component: &Component<P>) -> Self {
+        View {
+            shared: component.shared.clone(),
+            host: component.host.clone(),
+            #[cfg(target_os = "linux")]
+            timer: Mutex::new(None),
+            window: Mutex::new(None),
+            frame: Mutex::new(None),
+        }
+    }
+
+    fn open(&self, parent: *mut c_void, kind: FIDString) -> tresult {
+        if !platform_type_supported(kind) {
+            return kResultFalse;
+        }
+        let Ok(mut window) = self.window.try_lock() else { return kResultFalse };
+        *window = None;
+        #[cfg(target_os = "windows")]
+        let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = {
+            let host = self.host.clone();
+            (Parent::Win32(parent), Box::new(move || host.announce_latency()))
+        };
+        #[cfg(not(target_os = "windows"))]
+        let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = (Parent::X11(parent as usize as std::ffi::c_ulong), Box::new(|| {}));
+        *window = editor::open(parent, P::EDITOR_SIZE, self.shared.editor(), on_frame);
+        if window.is_none() {
+            return kResultFalse;
+        }
+        #[cfg(target_os = "linux")]
+        self.start_timer();
+        kResultOk
+    }
+
+    /// The window's own thread on Linux is not the host's UI thread, so the latency is announced from
+    /// a timer on the host's run loop instead. Without one it waits for the next `setActive(false)`.
+    #[cfg(target_os = "linux")]
+    fn start_timer(&self) {
+        let frame = self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(run_loop) = frame.and_then(|frame| frame.cast::<Linux::IRunLoop>()) else { return };
+        let Some(handler) = ComWrapper::new(Ticker(self.host.clone())).to_com_ptr::<Linux::ITimerHandler>() else { return };
+        if unsafe { run_loop.registerTimer(handler.as_ptr(), TIMER_MS) } == kResultOk {
+            *self.timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(Timer { run_loop, handler });
+        }
+    }
+
+    fn close(&self) {
+        #[cfg(target_os = "linux")]
+        self.timer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Ok(mut window) = self.window.try_lock() {
+            window.take();
+        }
+    }
+}
+
+impl<P: Plugin> Drop for View<P> {
+    fn drop(&mut self) {
+        guard((), || self.close())
+    }
+}
+
+#[cfg(target_os = "linux")]
+const TIMER_MS: u64 = 50;
+
+#[cfg(target_os = "linux")]
+struct Timer {
+    run_loop: ComPtr<Linux::IRunLoop>,
+    handler: ComPtr<Linux::ITimerHandler>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Timer {
+    fn drop(&mut self) {
+        unsafe { self.run_loop.unregisterTimer(self.handler.as_ptr()) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct Ticker(Arc<Host>);
+
+#[cfg(target_os = "linux")]
+impl Class for Ticker {
+    type Interfaces = (Linux::ITimerHandler,);
+}
+
+#[cfg(target_os = "linux")]
+impl Linux::ITimerHandlerTrait for Ticker {
+    unsafe fn onTimer(&self) {
+        // The host may unregister and release this handler from inside `restartComponent`.
+        let host = self.0.clone();
+        guard((), || host.announce_latency())
+    }
+}
+
+impl<P: Plugin> IPlugViewTrait for View<P> {
+    unsafe fn isPlatformTypeSupported(&self, kind: FIDString) -> tresult {
+        guard(kInternalError, || if platform_type_supported(kind) { kResultTrue } else { kResultFalse })
+    }
+
+    unsafe fn attached(&self, parent: *mut c_void, kind: FIDString) -> tresult {
+        guard(kInternalError, || self.open(parent, kind))
+    }
+
+    unsafe fn removed(&self) -> tresult {
+        guard(kInternalError, || {
+            self.close();
+            kResultOk
+        })
+    }
+
+    unsafe fn onWheel(&self, _distance: f32) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onKeyDown(&self, _key: char16, _key_code: int16, _modifiers: int16) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onKeyUp(&self, _key: char16, _key_code: int16, _modifiers: int16) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn getSize(&self, size: *mut ViewRect) -> tresult {
+        guard(kInternalError, || {
+            if size.is_null() {
+                return kInvalidArgument;
+            }
+            let (width, height) = P::EDITOR_SIZE;
+            unsafe { size.write(ViewRect { left: 0, top: 0, right: width as int32, bottom: height as int32 }) };
+            kResultOk
+        })
+    }
+
+    unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
+        guard(kInternalError, || {
+            let Some(rect) = (unsafe { new_size.as_ref() }) else { return kInvalidArgument };
+            let (width, height) = P::EDITOR_SIZE;
+            if (rect.right - rect.left, rect.bottom - rect.top) == (width as int32, height as int32) { kResultOk } else { kResultFalse }
+        })
+    }
+
+    unsafe fn onFocus(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn setFrame(&self, frame: *mut IPlugFrame) -> tresult {
+        guard(kInternalError, || {
+            let frame = unsafe { ComRef::from_raw(frame) }.map(|f| f.to_com_ptr());
+            *self.frame.lock().unwrap_or_else(|e| e.into_inner()) = frame;
+            kResultOk
+        })
+    }
+
+    unsafe fn canResize(&self) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
+        guard(kInternalError, || {
+            let Some(rect) = (unsafe { rect.as_mut() }) else { return kInvalidArgument };
+            let (width, height) = P::EDITOR_SIZE;
+            rect.right = rect.left + width as int32;
+            rect.bottom = rect.top + height as int32;
+            kResultTrue
+        })
     }
 }
 
@@ -681,7 +894,7 @@ mod tests {
         fn load(&self, _: &[u8]) -> bool {
             true
         }
-        fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send> {
+        fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
             Box::new(|_| {})
         }
     }
@@ -801,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn in_place_mono_is_processed_once_and_latency_changes_are_announced_from_the_main_thread() {
+    fn in_place_mono_is_processed_once_and_latency_changes_are_announced_from_the_ui_thread() {
         unsafe {
             let (component, processor, restarts) = create();
             let mut left = vec![0.5f32; 16];
@@ -822,20 +1035,100 @@ mod tests {
             assert_eq!(restarts.load(Ordering::SeqCst), 1);
 
             assert_eq!(component.getState(ptr::null_mut()), kInvalidArgument);
-            assert_eq!(restarts.load(Ordering::SeqCst), 2);
-            assert_eq!(processor.getLatencySamples(), 7);
+            assert_eq!(restarts.load(Ordering::SeqCst), 1, "saving may run off the UI thread, so it does not announce");
+            assert_eq!(processor.getLatencySamples(), 5);
 
             assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
             assert_eq!(component.setActive(0), kResultOk);
-            assert_eq!(restarts.load(Ordering::SeqCst), 3, "deactivation announces the change from the last block");
+            assert_eq!(restarts.load(Ordering::SeqCst), 2, "deactivation announces the change from the last block");
+            assert_eq!(processor.getLatencySamples(), 7);
             assert_eq!(component.setActive(0), kResultOk);
-            assert_eq!(restarts.load(Ordering::SeqCst), 3);
+            assert_eq!(restarts.load(Ordering::SeqCst), 2);
 
             assert_eq!(component.setActive(1), kResultOk);
-            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (5, 4));
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (5, 3));
             assert_eq!(component.setActive(0), kResultOk);
             assert_eq!(component.setActive(1), kResultOk);
-            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (9, 5));
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (9, 4));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct RunLoop {
+        timer: Mutex<Option<ComPtr<Linux::ITimerHandler>>>,
+        unregistered: AtomicI32,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Class for RunLoop {
+        type Interfaces = (IPlugFrame, Linux::IRunLoop);
+    }
+
+    #[cfg(target_os = "linux")]
+    impl IPlugFrameTrait for RunLoop {
+        unsafe fn resizeView(&self, _: *mut IPlugView, _: *mut ViewRect) -> tresult {
+            kResultFalse
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Linux::IRunLoopTrait for RunLoop {
+        unsafe fn registerEventHandler(&self, _: *mut Linux::IEventHandler, _: Linux::FileDescriptor) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn unregisterEventHandler(&self, _: *mut Linux::IEventHandler) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn registerTimer(&self, handler: *mut Linux::ITimerHandler, milliseconds: Linux::TimerInterval) -> tresult {
+            assert!((1..=100).contains(&milliseconds), "{milliseconds}");
+            *self.timer.lock().unwrap() = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr());
+            kResultOk
+        }
+        unsafe fn unregisterTimer(&self, handler: *mut Linux::ITimerHandler) -> tresult {
+            let mut timer = self.timer.lock().unwrap();
+            assert_eq!(timer.as_ref().map(|t| t.as_ptr()), Some(handler));
+            *timer = None;
+            self.unregistered.fetch_add(1, Ordering::SeqCst);
+            kResultOk
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_open_view_announces_latency_changes_from_a_timer_on_the_hosts_run_loop() {
+        use Linux::ITimerHandlerTrait;
+        unsafe {
+            let wrapper = ComWrapper::new(Component::<Doubler>::new());
+            let component = wrapper.to_com_ptr::<IComponent>().unwrap();
+            let processor = wrapper.to_com_ptr::<IAudioProcessor>().unwrap();
+            let restarts = Arc::new(AtomicI32::new(0));
+            let handler = ComWrapper::new(Handler(restarts.clone())).to_com_ptr::<IComponentHandler>().unwrap();
+            assert_eq!(wrapper.to_com_ptr::<IEditController>().unwrap().setComponentHandler(handler.as_ptr()), kResultOk);
+            setup(&processor);
+            assert_eq!(component.setActive(1), kResultOk);
+            let (mut left, mut right) = (vec![0.5f32; 16], vec![0.0f32; 16]);
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (5, 1));
+
+            let view = ComWrapper::new(View::<Doubler>::new(&wrapper));
+            let plug_view = view.to_com_ptr::<IPlugView>().unwrap();
+            view.start_timer();
+            let run_loop = ComWrapper::new(RunLoop::default());
+            assert_eq!(plug_view.setFrame(run_loop.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()), kResultOk);
+            view.start_timer();
+            let timer = run_loop.timer.lock().unwrap().clone().expect("a timer on the host's run loop");
+            timer.onTimer();
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (7, 2));
+            timer.onTimer();
+            assert_eq!(restarts.load(Ordering::SeqCst), 2, "nothing new to announce");
+
+            drop((component, processor, wrapper));
+            timer.onTimer();
+            assert_eq!(plug_view.removed(), kResultOk);
+            assert_eq!(run_loop.unregistered.load(Ordering::SeqCst), 1);
+            assert!(run_loop.timer.lock().unwrap().is_none());
+            assert_eq!(plug_view.setFrame(ptr::null_mut()), kResultOk);
         }
     }
 
