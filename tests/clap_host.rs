@@ -17,6 +17,7 @@ use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_
 use clap_sys::ext::gui::{CLAP_EXT_GUI, CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11, clap_plugin_gui, clap_window, clap_window_handle};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags, clap_plugin_params};
+use clap_sys::ext::track_info::{CLAP_EXT_TRACK_INFO, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info, clap_plugin_track_info, clap_track_info};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
@@ -103,10 +104,29 @@ unsafe extern "C" fn mark_dirty(_: *const clap_host) {
 static HOST_PARAMS: clap_host_params = clap_host_params { rescan: Some(rescan), clear: Some(clear), request_flush: Some(request_flush) };
 static HOST_STATE: clap_host_state = clap_host_state { mark_dirty: Some(mark_dirty) };
 
+/// What the test host answers `clap_host_track_info::get` with: the flags, the name and the colour.
+static TRACK: Mutex<(u64, &str, [u8; 3])> = Mutex::new((CLAP_TRACK_INFO_HAS_TRACK_NAME | CLAP_TRACK_INFO_HAS_TRACK_COLOR, "Bass", [255, 0, 0]));
+
+unsafe extern "C" fn track_info(_: *const clap_host, out: *mut clap_track_info) -> bool {
+    let (flags, name, [red, green, blue]) = *TRACK.lock().unwrap();
+    let out = unsafe { &mut *out };
+    out.flags = flags;
+    for (slot, byte) in out.name.iter_mut().zip(name.bytes()) {
+        *slot = byte as c_char;
+    }
+    out.color.red = red;
+    out.color.green = green;
+    out.color.blue = blue;
+    true
+}
+
+static HOST_TRACK_INFO: clap_host_track_info = clap_host_track_info { get: Some(track_info) };
+
 unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
     match unsafe { CStr::from_ptr(id) } {
         id if id == CLAP_EXT_PARAMS => &HOST_PARAMS as *const _ as *const c_void,
         id if id == CLAP_EXT_STATE => &HOST_STATE as *const _ as *const c_void,
+        id if id == CLAP_EXT_TRACK_INFO => &HOST_TRACK_INFO as *const _ as *const c_void,
         _ => ptr::null(),
     }
 }
@@ -623,6 +643,42 @@ fn mark_dirty_reaches_the_host() {
         assert_eq!(DIRTY_MARKS.load(Ordering::SeqCst), marks + 1);
         ((*plugin).on_main_thread.unwrap())(plugin);
         assert_eq!(DIRTY_MARKS.load(Ordering::SeqCst), marks + 1, "once per mark");
+        ((*plugin).destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+fn saved_state(plugin: *const clap_plugin) -> String {
+    unsafe {
+        let state: &clap_plugin_state = extension(plugin, CLAP_EXT_STATE);
+        let mut saved = Vec::<u8>::new();
+        let out = clap_ostream { ctx: &mut saved as *mut _ as *mut c_void, write: Some(write_some) };
+        assert!((state.save.unwrap())(plugin, &out));
+        String::from_utf8(saved).unwrap()
+    }
+}
+
+#[test]
+fn clap_track_info_reaches_the_plugin() {
+    let _turn = turn();
+    unsafe {
+        *TRACK.lock().unwrap() = (CLAP_TRACK_INFO_HAS_TRACK_NAME | CLAP_TRACK_INFO_HAS_TRACK_COLOR, "Bass", [255, 0, 0]);
+        let plugin = create();
+        assert!(saved_state(plugin).ends_with(";name=Bass;color=ff0000"), "read on init");
+
+        let track: &clap_plugin_track_info = extension(plugin, CLAP_EXT_TRACK_INFO);
+        *TRACK.lock().unwrap() = (CLAP_TRACK_INFO_HAS_TRACK_NAME | CLAP_TRACK_INFO_HAS_TRACK_COLOR, "Keys", [0, 128, 255]);
+        assert!(saved_state(plugin).ends_with(";name=Bass;color=ff0000"), "not before the host says it changed");
+        (track.changed.unwrap())(plugin);
+        assert!(saved_state(plugin).ends_with(";name=Keys;color=0080ff"));
+
+        *TRACK.lock().unwrap() = (CLAP_TRACK_INFO_HAS_TRACK_NAME, "Keys", [9, 9, 9]);
+        (track.changed.unwrap())(plugin);
+        assert!(saved_state(plugin).ends_with(";name=Keys"), "a colour only when the host has one");
+
+        *TRACK.lock().unwrap() = (CLAP_TRACK_INFO_HAS_TRACK_COLOR, "ignored", [1, 2, 3]);
+        (track.changed.unwrap())(plugin);
+        assert!(saved_state(plugin).ends_with(";color=010203"), "a name only when the host has one");
         ((*plugin).destroy.unwrap())(plugin);
         (entry().deinit.unwrap())();
     }

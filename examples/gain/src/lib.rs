@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
-use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
+use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Shared, TrackInfo, egui, export_clap, export_vst3};
 
 pub const GAIN: u32 = 0;
 pub const FREQUENCY: u32 = 1;
@@ -17,6 +17,7 @@ pub struct GainShared {
     db: AtomicI32,
     frequency: AtomicU64,
     cx: Mutex<Option<GuiContext>>,
+    track: Mutex<TrackInfo>,
 }
 
 impl GainShared {
@@ -63,13 +64,21 @@ impl Shared for GainShared {
     }
 
     fn save(&self) -> Vec<u8> {
-        format!("gain={};frequency={}", self.db.load(Ordering::Relaxed), self.param(FREQUENCY)).into_bytes()
+        let mut text = format!("gain={};frequency={}", self.db.load(Ordering::Relaxed), self.param(FREQUENCY));
+        let track = self.track.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(name) = &track.name {
+            text += &format!(";name={name}");
+        }
+        if let Some([r, g, b]) = track.color {
+            text += &format!(";color={r:02x}{g:02x}{b:02x}");
+        }
+        text.into_bytes()
     }
 
     fn load(&self, bytes: &[u8]) -> bool {
         let Some(text) = std::str::from_utf8(bytes).ok() else { return false };
         let Some((db, frequency)) = text.strip_prefix("gain=").and_then(|rest| rest.split_once(";frequency=")) else { return false };
-        let (Ok(db), Ok(frequency)) = (db.parse::<i32>(), frequency.parse::<f64>()) else { return false };
+        let (Ok(db), Ok(frequency)) = (db.parse::<i32>(), frequency.split(';').next().unwrap_or_default().parse::<f64>()) else { return false };
         if !(-60..=24).contains(&db) || !(20.0..=20000.0).contains(&frequency) {
             return false;
         }
@@ -88,6 +97,10 @@ impl Shared for GainShared {
 
     fn attach(&self, cx: GuiContext) {
         *self.cx.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx);
+    }
+
+    fn set_track(&self, info: TrackInfo) {
+        *self.track.lock().unwrap_or_else(|e| e.into_inner()) = info;
     }
 }
 
@@ -113,7 +126,7 @@ impl Plugin for Gain {
     type Shared = GainShared;
 
     fn new() -> (Self, Arc<GainShared>) {
-        let shared = Arc::new(GainShared { db: AtomicI32::new(0), frequency: AtomicU64::new(1000f64.to_bits()), cx: Mutex::new(None) });
+        let shared = Arc::new(GainShared { db: AtomicI32::new(0), frequency: AtomicU64::new(1000f64.to_bits()), cx: Mutex::new(None), track: Mutex::new(TrackInfo::default()) });
         (Gain { shared: shared.clone(), inputs: 1 }, shared)
     }
 

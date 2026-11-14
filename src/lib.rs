@@ -54,6 +54,9 @@ pub trait Shared: Send + Sync + 'static {
     /// Called once the host is known, before any window opens, and again should a VST3 host replace
     /// its component handler; `cx` is the same each time. For changes made without an open editor.
     fn attach(&self, _cx: GuiContext) {}
+    /// What the host says about the track, once the host is known and whenever it changes. Called on
+    /// the host's main thread.
+    fn set_track(&self, _info: TrackInfo) {}
 }
 
 /// What the host says about the track the plugin is on.

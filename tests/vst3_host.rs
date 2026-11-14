@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use gain::{FREQUENCY, GAIN, TEST_GESTURE};
 use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
+use vst3::Steinberg::Vst::ChannelContext::{IInfoListener, IInfoListenerTrait, kChannelColorKey, kChannelNameKey};
 use vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
 use vst3::Steinberg::Vst::*;
@@ -599,6 +600,89 @@ fn mark_dirty_reaches_the_host() {
         assert_eq!(plugin.controller.setParamNormalized(TEST_GESTURE, 1.0), kResultOk);
         let restarts: Vec<Edit> = recorder.take().into_iter().filter(|e| matches!(e, Edit::Restart(_))).collect();
         assert_eq!(restarts, [Edit::Restart(kParamValuesChanged)]);
+        plugin.component.terminate();
+    }
+}
+
+struct Channel {
+    name: Option<&'static str>,
+    argb: Option<i64>,
+}
+
+impl Class for Channel {
+    type Interfaces = (IAttributeList,);
+}
+
+impl IAttributeListTrait for Channel {
+    unsafe fn setInt(&self, _: IAttributeList_::AttrID, _: int64) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn getInt(&self, id: IAttributeList_::AttrID, value: *mut int64) -> tresult {
+        match self.argb {
+            Some(argb) if unsafe { CStr::from_ptr(id) } == unsafe { CStr::from_ptr(kChannelColorKey) } => {
+                unsafe { *value = argb };
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+    unsafe fn setFloat(&self, _: IAttributeList_::AttrID, _: f64) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn getFloat(&self, _: IAttributeList_::AttrID, _: *mut f64) -> tresult {
+        kResultFalse
+    }
+    unsafe fn setString(&self, _: IAttributeList_::AttrID, _: *const TChar) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn getString(&self, id: IAttributeList_::AttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
+        match self.name {
+            Some(name) if unsafe { CStr::from_ptr(id) } == unsafe { CStr::from_ptr(kChannelNameKey) } => {
+                let mut units: Vec<TChar> = name.encode_utf16().map(|u| u as TChar).collect();
+                units.truncate((size_in_bytes as usize / 2).saturating_sub(1));
+                units.push(0);
+                unsafe { ptr::copy_nonoverlapping(units.as_ptr(), string, units.len()) };
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+    unsafe fn setBinary(&self, _: IAttributeList_::AttrID, _: *const c_void, _: uint32) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn getBinary(&self, _: IAttributeList_::AttrID, _: *mut *const c_void, _: *mut uint32) -> tresult {
+        kResultFalse
+    }
+}
+
+fn saved_state(plugin: &Instance) -> String {
+    unsafe {
+        let saved = memory(Vec::new());
+        assert_eq!(plugin.component.getState(saved.to_com_ptr::<IBStream>().unwrap().as_ptr()), kResultOk);
+        let bytes = saved.bytes.borrow().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+}
+
+#[test]
+fn vst3_channel_context_reaches_the_plugin() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let listener = plugin.controller.cast::<IInfoListener>().expect("the controller listens to the channel context");
+
+        let both = ComWrapper::new(Channel { name: Some("Bass"), argb: Some(0xFFFF_0000) });
+        assert_eq!(listener.setChannelContextInfos(both.to_com_ptr::<IAttributeList>().unwrap().as_ptr()), kResultOk);
+        assert!(saved_state(&plugin).ends_with(";name=Bass;color=ff0000"));
+
+        let colour_only = ComWrapper::new(Channel { name: None, argb: Some(0xFF00_80FF) });
+        assert_eq!(listener.setChannelContextInfos(colour_only.to_com_ptr::<IAttributeList>().unwrap().as_ptr()), kResultOk);
+        assert!(saved_state(&plugin).ends_with(";color=0080ff"), "a name only when the host has one");
+
+        let name_only = ComWrapper::new(Channel { name: Some("Keys"), argb: None });
+        assert_eq!(listener.setChannelContextInfos(name_only.to_com_ptr::<IAttributeList>().unwrap().as_ptr()), kResultOk);
+        assert!(saved_state(&plugin).ends_with(";name=Keys"), "a colour only when the host has one");
+        assert_ne!(listener.setChannelContextInfos(ptr::null_mut()), kResultOk);
         plugin.component.terminate();
     }
 }

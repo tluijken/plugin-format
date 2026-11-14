@@ -23,7 +23,7 @@ use vst3::Steinberg::Linux::IRunLoopTrait;
 
 use crate::editor::{self, Parent};
 use crate::gui_context::Event;
-use crate::{Extras, GuiContext, Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
+use crate::{Extras, GuiContext, Kind, ParamInfo, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
 
 const CATEGORY: &str = "Audio Module Class";
 
@@ -281,7 +281,7 @@ impl Host {
 }
 
 impl<P: Plugin> Class for Component<P> {
-    type Interfaces = (IComponent, IAudioProcessor, IEditController, IProcessContextRequirements);
+    type Interfaces = (IComponent, IAudioProcessor, IEditController, IProcessContextRequirements, ChannelContext::IInfoListener);
 }
 
 impl<P: Plugin> Drop for Component<P> {
@@ -676,6 +676,23 @@ impl<P: Plugin> IAudioProcessorTrait for Component<P> {
 impl<P: Plugin> IProcessContextRequirementsTrait for Component<P> {
     unsafe fn getProcessContextRequirements(&self) -> uint32 {
         kNeedTransportState as uint32
+    }
+}
+
+impl<P: Plugin> ChannelContext::IInfoListenerTrait for Component<P> {
+    unsafe fn setChannelContextInfos(&self, list: *mut IAttributeList) -> tresult {
+        guard(kInternalError, || {
+            let Some(list) = (unsafe { ComRef::from_raw(list) }) else { return kInvalidArgument };
+            let mut buffer = [0 as TChar; 256];
+            let name = (unsafe { list.getString(ChannelContext::kChannelNameKey, buffer.as_mut_ptr(), size_of_val(&buffer) as u32) } == kResultOk).then(|| {
+                let units: Vec<u16> = buffer.iter().map(|&c| c as u16).take_while(|&c| c != 0).collect();
+                String::from_utf16_lossy(&units)
+            });
+            let mut argb = 0i64;
+            let color = (unsafe { list.getInt(ChannelContext::kChannelColorKey, &mut argb) } == kResultOk).then(|| [(argb >> 16) as u8, (argb >> 8) as u8, argb as u8]);
+            self.host.cx.set_track(TrackInfo { name, color });
+            kResultOk
+        })
     }
 }
 

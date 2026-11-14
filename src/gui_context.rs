@@ -11,7 +11,7 @@ pub struct GuiContext(Arc<Channel>);
 
 impl GuiContext {
     pub(crate) fn new(shared: Weak<dyn Shared>) -> Self {
-        GuiContext(Arc::new(Channel { shared, queue: Queue::default(), dirty: AtomicBool::new(false), wake: RwLock::new(None) }))
+        GuiContext(Arc::new(Channel { shared, queue: Queue::default(), dirty: AtomicBool::new(false), wake: RwLock::new(None), track: Mutex::new(None) }))
     }
 
     /// Starts a gesture on `id`, e.g. when a drag begins, so the host groups what follows into one undo step.
@@ -48,7 +48,15 @@ impl GuiContext {
 
     /// What the host said about the track the plugin is on, if anything.
     pub fn track(&self) -> Option<TrackInfo> {
-        None
+        self.0.track.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Keeps `info` as the latest and hands it to the shared half.
+    pub(crate) fn set_track(&self, info: TrackInfo) {
+        *self.0.track.lock().unwrap_or_else(|e| e.into_inner()) = Some(info.clone());
+        if let Some(shared) = self.0.shared.upgrade() {
+            shared.set_track(info);
+        }
     }
 
     /// Lets the wrapper hear of new work; `wake` must not block and may be called from any thread
@@ -81,6 +89,7 @@ struct Channel {
     queue: Queue,
     dirty: AtomicBool,
     wake: RwLock<Option<Waker>>,
+    track: Mutex<Option<TrackInfo>>,
 }
 
 impl Channel {

@@ -18,6 +18,9 @@ use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params};
+use clap_sys::ext::track_info::{
+    CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info, clap_plugin_track_info, clap_track_info,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
@@ -30,7 +33,7 @@ use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
 use crate::editor::{self, Parent};
 use crate::gui_context::{Event, Wake};
-use crate::{Extras, GuiContext, Kind, Plugin, Shared, copy_str, guard, process_block};
+use crate::{Extras, GuiContext, Kind, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
 
 fn same(a: *const c_char, b: &CStr) -> bool {
     !a.is_null() && unsafe { CStr::from_ptr(a) } == b
@@ -134,6 +137,7 @@ struct Instance<P: Plugin> {
     latency: AtomicU32,
     host_latency: AtomicPtr<clap_host_latency>,
     host_state: AtomicPtr<clap_host_state>,
+    host_track_info: AtomicPtr<clap_host_track_info>,
     /// Its events go out from `process` or `flush`, its dirty mark from `on_main_thread`.
     cx: GuiContext,
     gui: Mutex<Gui>,
@@ -169,6 +173,7 @@ impl<P: Plugin> Instance<P> {
             latency: AtomicU32::new(latency),
             host_latency: AtomicPtr::new(ptr::null_mut()),
             host_state: AtomicPtr::new(ptr::null_mut()),
+            host_track_info: AtomicPtr::new(ptr::null_mut()),
             cx,
             gui: Mutex::default(),
         }));
@@ -217,6 +222,12 @@ impl<P: Plugin> Instance<P> {
                 }
             }));
             instance.shared.attach(instance.cx.clone());
+            let mut track = unsafe { instance.host_extension(CLAP_EXT_TRACK_INFO) };
+            if track.is_null() {
+                track = unsafe { instance.host_extension(CLAP_EXT_TRACK_INFO_COMPAT) };
+            }
+            instance.host_track_info.store(track as *mut clap_host_track_info, Ordering::Release);
+            instance.read_track();
             true
         })
     }
@@ -405,11 +416,34 @@ impl<P: Plugin> Instance<P> {
                 &Self::AUDIO_PORTS_CONFIG as *const _ as _
             } else if same(id, CLAP_EXT_GUI) {
                 &Self::GUI as *const _ as _
+            } else if same(id, CLAP_EXT_TRACK_INFO) || same(id, CLAP_EXT_TRACK_INFO_COMPAT) {
+                &Self::TRACK_INFO as *const _ as _
             } else {
                 ptr::null()
             };
             ext
         })
+    }
+
+    const TRACK_INFO: clap_plugin_track_info = clap_plugin_track_info { changed: Some(Self::track_changed) };
+
+    unsafe extern "C" fn track_changed(plugin: *const clap_plugin) {
+        Self::with(plugin, || (), |instance| instance.read_track())
+    }
+
+    fn read_track(&self) {
+        let Some(host_track) = (unsafe { self.host_track_info.load(Ordering::Acquire).as_ref() }) else { return };
+        let Some(get) = host_track.get else { return };
+        let mut raw: clap_track_info = unsafe { std::mem::zeroed() };
+        if !unsafe { get(self.host, &mut raw) } {
+            return;
+        }
+        let name = (raw.flags & CLAP_TRACK_INFO_HAS_TRACK_NAME != 0).then(|| {
+            let bytes: Vec<u8> = raw.name.iter().map(|&c| c as u8).take_while(|&c| c != 0).collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        let color = (raw.flags & CLAP_TRACK_INFO_HAS_TRACK_COLOR != 0).then_some([raw.color.red, raw.color.green, raw.color.blue]);
+        self.cx.set_track(TrackInfo { name, color });
     }
 
     const PARAMS: clap_plugin_params = clap_plugin_params {
