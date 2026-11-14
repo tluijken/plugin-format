@@ -199,7 +199,8 @@ struct Host {
     /// What `getLatencySamples` reports. It never reads `plugin`, so a host may ask at any time.
     latency: AtomicU32,
     /// Left by `process` for a call on the host's UI thread to announce, since Steinberg requires
-    /// `restartComponent` there: `setActive(false)` or the open editor's timer.
+    /// `restartComponent` there: `setActive(false)`, the open editor's timer, or a parameter or state
+    /// call.
     new_latency: AtomicU32,
     latency_changed: AtomicBool,
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
@@ -258,6 +259,14 @@ impl Host {
         if self.latency_changed.swap(false, Ordering::AcqRel) {
             self.latency.store(self.new_latency.load(Ordering::Acquire), Ordering::Release);
             self.restart(kLatencyChanged);
+        }
+    }
+
+    /// For the calls a host makes on the UI thread whether or not the editor is open, so a change
+    /// waits for at most the next one.
+    fn announce_latency_here(&self) {
+        if self.on_ui_thread() {
+            self.announce_latency();
         }
     }
 
@@ -617,7 +626,10 @@ impl<P: Plugin> IComponentTrait for Component<P> {
     }
 
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
-        guard(kInternalError, || self.load_state(state))
+        guard(kInternalError, || {
+            self.host.announce_latency_here();
+            self.load_state(state)
+        })
     }
 
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
@@ -730,11 +742,17 @@ impl<P: Plugin> ChannelContext::IInfoListenerTrait for Component<P> {
 impl<P: Plugin> IEditControllerTrait for Component<P> {
     /// The component's own `setState` already loaded it.
     unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
-        kResultOk
+        guard(kInternalError, || {
+            self.host.announce_latency_here();
+            kResultOk
+        })
     }
 
     unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
-        kResultOk
+        guard(kInternalError, || {
+            self.host.announce_latency_here();
+            kResultOk
+        })
     }
 
     unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
@@ -800,11 +818,15 @@ impl<P: Plugin> IEditControllerTrait for Component<P> {
     }
 
     unsafe fn getParamNormalized(&self, id: ParamID) -> ParamValue {
-        guard(0.0, || self.info(id).map_or(0.0, |info| info.normalise(self.shared.param(id))))
+        guard(0.0, || {
+            self.host.announce_latency_here();
+            self.info(id).map_or(0.0, |info| info.normalise(self.shared.param(id)))
+        })
     }
 
     unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
         guard(kInternalError, || {
+            self.host.announce_latency_here();
             let Some(info) = self.info(id) else { return kInvalidArgument };
             self.shared.set_param(id, info.plain(value));
             kResultOk
@@ -1326,6 +1348,43 @@ mod tests {
             assert_eq!(component.setActive(0), kResultOk);
             assert_eq!(component.setActive(1), kResultOk);
             assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (9, 4));
+        }
+    }
+
+    /// A host without the editor open hears of a latency change at its next call on the UI thread
+    /// that edits or reads the parameters or the state.
+    #[test]
+    fn without_a_view_the_next_ui_thread_call_announces_latency_changes() {
+        unsafe {
+            let (component, processor, restarts) = create();
+            let controller = component.cast::<IEditController>().unwrap();
+            setup(&processor);
+            assert_eq!(component.setActive(1), kResultOk);
+            let (mut left, mut right) = (vec![0.5f32; 16], vec![0.0f32; 16]);
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (5, 1));
+            controller.getParamNormalized(0);
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (7, 2));
+            controller.getParamNormalized(0);
+            assert_eq!(restarts.load(Ordering::SeqCst), 2, "nothing new to announce");
+
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            assert_eq!(controller.setParamNormalized(0, 0.5), kInvalidArgument);
+            assert_eq!(restarts.load(Ordering::SeqCst), 3);
+
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            let elsewhere = std::thread::spawn({
+                let controller = controller.clone();
+                move || controller.getParamNormalized(0)
+            });
+            elsewhere.join().unwrap();
+            assert_eq!(restarts.load(Ordering::SeqCst), 3, "off the UI thread it waits");
+            assert_eq!(controller.setComponentState(ptr::null_mut()), kResultOk);
+            assert_eq!(restarts.load(Ordering::SeqCst), 4);
+
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            assert_eq!(component.setState(ptr::null_mut()), kInvalidArgument);
+            assert_eq!(restarts.load(Ordering::SeqCst), 5);
         }
     }
 
