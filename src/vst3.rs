@@ -223,16 +223,25 @@ impl Host {
         let weak = Arc::downgrade(&host);
         // Steinberg wants the handler called on the UI thread, while the context may be used from any
         // thread, on Linux from the editor's own. So a call from the UI thread is delivered at once and
-        // any other waits for the next delivery there: the open view's run-loop timer on Linux, the
-        // editor's frame on Windows (where the window runs on the UI thread), or a new handler.
+        // any other waits for the next delivery there: any open view's run-loop timer on Linux (also
+        // another instance's, whose editor may be the one writing), the editor's frame on Windows
+        // (where the window runs on the UI thread), or a new handler.
         host.cx.connect(Box::new(move |_| {
-            if let Some(host) = weak.upgrade()
-                && *host.ui_thread.lock().unwrap_or_else(|e| e.into_inner()) == Some(std::thread::current().id())
-            {
+            let Some(host) = weak.upgrade() else { return };
+            if host.on_ui_thread() {
                 host.deliver();
+            } else {
+                let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+                if !waiting.iter().any(|w| w.ptr_eq(&weak)) {
+                    waiting.push(weak.clone());
+                }
             }
         }));
         host
+    }
+
+    fn on_ui_thread(&self) -> bool {
+        *self.ui_thread.lock().unwrap_or_else(|e| e.into_inner()) == Some(std::thread::current().id())
     }
 
     fn handler(&self) -> Option<ComPtr<IComponentHandler>> {
@@ -277,6 +286,28 @@ impl Host {
     fn tick(&self) {
         self.announce_latency();
         self.deliver();
+        deliver_waiting();
+    }
+}
+
+/// The instances in the library with changes made off the UI thread, for whichever instance ticks
+/// there first.
+static WAITING: Mutex<Vec<Weak<Host>>> = Mutex::new(Vec::new());
+
+/// On the UI thread: delivers for every waiting instance whose UI thread it is.
+fn deliver_waiting() {
+    let waiting = std::mem::take(&mut *WAITING.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut elsewhere = Vec::new();
+    for weak in waiting {
+        let Some(host) = weak.upgrade() else { continue };
+        if host.on_ui_thread() {
+            host.deliver();
+        } else {
+            elsewhere.push(weak);
+        }
+    }
+    if !elsewhere.is_empty() {
+        WAITING.lock().unwrap_or_else(|e| e.into_inner()).extend(elsewhere);
     }
 }
 
@@ -1508,6 +1539,39 @@ mod tests {
             let timer = run_loop.timer.lock().unwrap().clone().expect("a timer on the host's run loop");
             timer.onTimer();
             assert_eq!(*edits.0.lock().unwrap(), ["begin 3", "perform 3 0.25", "end 3", &format!("restart {kParamValuesChanged}")]);
+            assert_eq!(plug_view.removed(), kResultOk);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_instances_open_view_delivers_a_gesture_made_off_the_ui_thread() {
+        use Linux::ITimerHandlerTrait;
+        unsafe {
+            let (shown, written) = (ComWrapper::new(Component::<Leveller>::new()), ComWrapper::new(Component::<Leveller>::new()));
+            let (unused, edits) = (ComWrapper::new(Edits::default()), ComWrapper::new(Edits::default()));
+            let handler = |edits: &ComWrapper<Edits>| edits.to_com_ptr::<IComponentHandler>().unwrap();
+            assert_eq!(shown.to_com_ptr::<IEditController>().unwrap().setComponentHandler(handler(&unused).as_ptr()), kResultOk);
+            assert_eq!(written.to_com_ptr::<IEditController>().unwrap().setComponentHandler(handler(&edits).as_ptr()), kResultOk);
+            let cx = written.shared.0.lock().unwrap().clone().expect("attached once the handler is known");
+
+            let view = ComWrapper::new(View::<Leveller>::new(&shown));
+            let plug_view = view.to_com_ptr::<IPlugView>().unwrap();
+            let run_loop = ComWrapper::new(RunLoop::default());
+            assert_eq!(plug_view.setFrame(run_loop.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()), kResultOk);
+            view.start_timer();
+            std::thread::spawn(move || {
+                cx.begin(3);
+                cx.set(3, 2.5);
+                cx.end(3);
+            })
+            .join()
+            .unwrap();
+            assert!(edits.0.lock().unwrap().is_empty(), "nothing reaches the handler off the UI thread");
+            let timer = run_loop.timer.lock().unwrap().clone().expect("a timer on the host's run loop");
+            timer.onTimer();
+            assert_eq!(*edits.0.lock().unwrap(), ["begin 3", "perform 3 0.25", "end 3"]);
+            assert!(unused.0.lock().unwrap().is_empty());
             assert_eq!(plug_view.removed(), kResultOk);
         }
     }
