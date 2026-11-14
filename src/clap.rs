@@ -103,6 +103,21 @@ pub const fn entry<P: Plugin>() -> clap_plugin_entry {
     clap_plugin_entry { clap_version: CLAP_VERSION, init: Some(entry_init), deinit: Some(entry_deinit), get_factory: Some(get_factory::<P>) }
 }
 
+/// A new editor for `plugin`, to draw into any `Ui` without a window, e.g. in tests: what it changes reaches the
+/// host as from an editor in a window, through the instance's own `GuiContext`. `None` for a null `plugin` or one
+/// another library made.
+///
+/// # Safety
+///
+/// `plugin` is null or a live plugin instance, and one this library made is an instance of `P`.
+pub unsafe fn editor<P: Plugin>(plugin: *const clap_plugin) -> Option<crate::Editor> {
+    if !ptr::eq(unsafe { plugin.as_ref() }?.desc, descriptor::<P>()) {
+        return None;
+    }
+    let instance = unsafe { Instance::<P>::from(plugin) }?;
+    Some(instance.shared.editor(instance.cx.clone()))
+}
+
 unsafe extern "C" fn entry_init(_path: *const c_char) -> bool {
     true
 }
@@ -1310,6 +1325,23 @@ mod tests {
             assert!((gui.create.unwrap())(plugin, NATIVE_API.unwrap().as_ptr(), false));
             assert_eq!(gui_size_of(gui, plugin), (1000, 600), "a new gui opens at the size it was left at");
             (gui.destroy.unwrap())(plugin);
+            (p.destroy.unwrap())(plugin);
+        }
+    }
+
+    #[test]
+    fn an_editor_without_a_window_is_the_instances_own() {
+        let host = sized_host();
+        unsafe {
+            assert!(editor::<Wide>(ptr::null()).is_none());
+            let factory = &Factory::<Wide>::FACTORY;
+            let plugin = (factory.create_plugin.unwrap())(factory, &host, descriptor::<Wide>().id);
+            let p = &*plugin;
+            assert!((p.init.unwrap())(plugin));
+            let mut drawn = editor::<Wide>(plugin).expect("an editor for the instance");
+            egui::__run_test_ui(|ui| drawn(ui));
+            let stranger = clap_plugin { desc: ptr::null(), ..*p };
+            assert!(editor::<Wide>(&stranger).is_none(), "not this library's");
             (p.destroy.unwrap())(plugin);
         }
     }

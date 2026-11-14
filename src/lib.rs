@@ -10,6 +10,9 @@ pub use egui;
 pub use gui_context::GuiContext;
 pub use param::*;
 
+/// An editor: drawn into the root `Ui` once per frame.
+pub type Editor = Box<dyn FnMut(&mut egui::Ui) + Send>;
+
 pub struct Info {
     pub name: &'static str,
     pub vendor: &'static str,
@@ -58,7 +61,7 @@ pub trait Shared: Send + Sync + 'static {
     /// A new one for every window the host opens. The window's thread calls it with the root `Ui` for
     /// every frame while the window is open: on Linux a thread of its own, on Windows and macOS the host's UI thread.
     /// `cx` is the instance's, the same one `attach` was given.
-    fn editor(&self, cx: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send>;
+    fn editor(&self, cx: GuiContext) -> Editor;
     /// Called once the host is known, before any window opens, and again should a VST3 host replace
     /// its component handler; `cx` is the same each time. For changes made without an open editor.
     fn attach(&self, _cx: GuiContext) {}
