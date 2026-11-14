@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Shared, TrackInfo, egui, export_clap, export_vst3};
 
@@ -142,7 +142,12 @@ impl Plugin for Gain {
     type Shared = GainShared;
 
     fn new() -> (Self, Arc<GainShared>) {
-        let shared = Arc::new(GainShared { db: AtomicI32::new(0), frequency: AtomicU64::new(1000f64.to_bits()), cx: Mutex::new(None), track: Mutex::new(TrackInfo::default()) });
+        let shared = Arc::new(GainShared {
+            db: AtomicI32::new(0),
+            frequency: AtomicU64::new(1000f64.to_bits()),
+            cx: Mutex::new(None),
+            track: Mutex::new(TrackInfo::default()),
+        });
         (Gain { shared: shared.clone(), inputs: 1 }, shared)
     }
 

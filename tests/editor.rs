@@ -106,7 +106,9 @@ mod platform {
             let (connection, screen) = x11rb::connect(None).ok()?;
             let root = connection.setup().roots[screen].root;
             let id = connection.generate_id().ok()?;
-            connection.create_window(x11rb::COPY_DEPTH_FROM_PARENT, id, root, 0, 0, 1200, 800, 0, WindowClass::INPUT_OUTPUT, 0, &CreateWindowAux::new()).ok()?;
+            connection
+                .create_window(x11rb::COPY_DEPTH_FROM_PARENT, id, root, 0, 0, 1200, 800, 0, WindowClass::INPUT_OUTPUT, 0, &CreateWindowAux::new())
+                .ok()?;
             connection.map_window(id).ok()?;
             connection.flush().ok()?;
             Some(Parent { connection, id })
@@ -152,7 +154,22 @@ mod platform {
         /// `None` without a display.
         pub fn new() -> Option<Self> {
             let class = windows_sys::w!("STATIC");
-            let hwnd = unsafe { CreateWindowExW(0, class, ptr::null(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 1200, 800, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null()) };
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class,
+                    ptr::null(),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    0,
+                    0,
+                    1200,
+                    800,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
             (!hwnd.is_null()).then_some(Parent(hwnd))
         }
 
@@ -201,8 +218,8 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use objc2::{MainThreadMarker, MainThreadOnly};
     use objc2::rc::Retained;
+    use objc2::{MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask, NSWindow, NSWindowStyleMask};
     use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
 
@@ -223,7 +240,13 @@ mod platform {
             app.finishLaunching();
             let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1200.0, 800.0));
             let window = unsafe {
-                NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), rect, NSWindowStyleMask::Borderless, NSBackingStoreType::Buffered, false)
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    rect,
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
             };
             unsafe { window.setReleasedWhenClosed(false) };
             window.orderFrontRegardless();

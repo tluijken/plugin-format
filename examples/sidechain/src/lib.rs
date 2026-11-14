@@ -5,13 +5,8 @@ use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Share
 
 pub const POSITION: u32 = 0;
 
-pub const INFOS: [ParamInfo; 1] = [ParamInfo {
-    id: POSITION,
-    name: "Position",
-    kind: Kind::Float { min: -1.0, max: 1e15, map: Map::Linear },
-    default: -1.0,
-    automatable: false,
-}];
+pub const INFOS: [ParamInfo; 1] =
+    [ParamInfo { id: POSITION, name: "Position", kind: Kind::Float { min: -1.0, max: 1e15, map: Map::Linear }, default: -1.0, automatable: false }];
 
 /// The last block's position as an f64, or -1 when the host gave none.
 pub struct SidechainShared {

@@ -8,16 +8,21 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{
-    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_VALUE, clap_event_header, clap_event_param_gesture,
-    clap_event_param_value, clap_input_events, clap_output_events,
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_VALUE, clap_event_header,
+    clap_event_param_gesture, clap_event_param_value, clap_input_events, clap_output_events,
 };
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{self as gui_ext, CLAP_EXT_GUI, CLAP_WINDOW_API_WAYLAND, clap_plugin_gui, clap_window, clap_window_handle};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
-use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags, clap_plugin_params};
-use clap_sys::ext::track_info::{CLAP_EXT_TRACK_INFO, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info, clap_plugin_track_info, clap_track_info};
+use clap_sys::ext::params::{
+    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags,
+    clap_plugin_params,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
+use clap_sys::ext::track_info::{
+    CLAP_EXT_TRACK_INFO, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info, clap_plugin_track_info, clap_track_info,
+};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
@@ -240,12 +245,21 @@ unsafe fn run(plugin: *const clap_plugin, inputs: &mut [Vec<f32>], outputs: &mut
     unsafe { run_with(plugin, inputs, outputs, frames, in_events, &OUT_EVENTS) }
 }
 
-unsafe fn run_with(plugin: *const clap_plugin, inputs: &mut [Vec<f32>], outputs: &mut [Vec<f32>], frames: u32, in_events: &clap_input_events, out_events: &clap_output_events) {
+unsafe fn run_with(
+    plugin: *const clap_plugin,
+    inputs: &mut [Vec<f32>],
+    outputs: &mut [Vec<f32>],
+    frames: u32,
+    in_events: &clap_input_events,
+    out_events: &clap_output_events,
+) {
     unsafe {
         let mut in_ptrs: Vec<*mut f32> = inputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
         let mut out_ptrs: Vec<*mut f32> = outputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
-        let input = clap_audio_buffer { data32: in_ptrs.as_mut_ptr(), data64: ptr::null_mut(), channel_count: inputs.len() as u32, latency: 0, constant_mask: 0 };
-        let mut output = clap_audio_buffer { data32: out_ptrs.as_mut_ptr(), data64: ptr::null_mut(), channel_count: outputs.len() as u32, latency: 0, constant_mask: 0 };
+        let input =
+            clap_audio_buffer { data32: in_ptrs.as_mut_ptr(), data64: ptr::null_mut(), channel_count: inputs.len() as u32, latency: 0, constant_mask: 0 };
+        let mut output =
+            clap_audio_buffer { data32: out_ptrs.as_mut_ptr(), data64: ptr::null_mut(), channel_count: outputs.len() as u32, latency: 0, constant_mask: 0 };
         let process = clap_process {
             steady_time: 0,
             frames_count: frames,

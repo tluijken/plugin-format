@@ -2,28 +2,33 @@ use std::cell::{Cell, UnsafeCell};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[doc(hidden)]
 pub use clap_sys as sys;
 
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{
-    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_VALUE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_IS_PLAYING,
-    clap_event_header, clap_event_param_gesture, clap_event_param_value, clap_input_events, clap_output_events,
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_VALUE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE,
+    CLAP_TRANSPORT_IS_PLAYING, clap_event_header, clap_event_param_gesture, clap_event_param_value, clap_input_events, clap_output_events,
 };
-use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info, clap_plugin_audio_ports};
+use clap_sys::ext::audio_ports::{
+    CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info, clap_plugin_audio_ports,
+};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
-use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params};
-use clap_sys::ext::track_info::{
-    CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info, clap_plugin_track_info, clap_track_info,
+use clap_sys::ext::params::{
+    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
-use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
+use clap_sys::ext::track_info::{
+    CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME, clap_host_track_info,
+    clap_plugin_track_info, clap_track_info,
+};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
+use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
 use clap_sys::host::clap_host;
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -77,10 +82,8 @@ fn descriptor<P: Plugin>() -> &'static clap_plugin_descriptor {
     &DESCRIPTOR
         .get_or_init(|| {
             let info = &P::INFO;
-            let strings: Vec<CString> = [info.clap_id, info.name, info.vendor, info.version, info.description]
-                .iter()
-                .map(|s| CString::new(*s).unwrap_or_default())
-                .collect();
+            let strings: Vec<CString> =
+                [info.clap_id, info.name, info.vendor, info.version, info.description].iter().map(|s| CString::new(*s).unwrap_or_default()).collect();
             let features: Vec<*const c_char> = info.clap_features.iter().map(|f| f.as_ptr()).chain([ptr::null()]).collect();
             let clap = clap_plugin_descriptor {
                 clap_version: CLAP_VERSION,
@@ -126,19 +129,14 @@ unsafe extern "C" fn entry_init(_path: *const c_char) -> bool {
 unsafe extern "C" fn entry_deinit() {}
 
 unsafe extern "C" fn get_factory<P: Plugin>(id: *const c_char) -> *const c_void {
-    guard(ptr::null(), || {
-        if same(id, CLAP_PLUGIN_FACTORY_ID) { &Factory::<P>::FACTORY as *const clap_plugin_factory as *const c_void } else { ptr::null() }
-    })
+    guard(ptr::null(), || if same(id, CLAP_PLUGIN_FACTORY_ID) { &Factory::<P>::FACTORY as *const clap_plugin_factory as *const c_void } else { ptr::null() })
 }
 
 struct Factory<P>(std::marker::PhantomData<P>);
 
 impl<P: Plugin> Factory<P> {
-    const FACTORY: clap_plugin_factory = clap_plugin_factory {
-        get_plugin_count: Some(Self::count),
-        get_plugin_descriptor: Some(Self::descriptor),
-        create_plugin: Some(Self::create),
-    };
+    const FACTORY: clap_plugin_factory =
+        clap_plugin_factory { get_plugin_count: Some(Self::count), get_plugin_descriptor: Some(Self::descriptor), create_plugin: Some(Self::create) };
 
     unsafe extern "C" fn count(_: *const clap_plugin_factory) -> u32 {
         1
@@ -241,33 +239,37 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn init(plugin: *const clap_plugin) -> bool {
-        Self::with(plugin, || false, |instance| {
-            let latency = unsafe { instance.host_extension(CLAP_EXT_LATENCY) } as *mut clap_host_latency;
-            instance.host_latency.store(latency, Ordering::Release);
-            let state = unsafe { instance.host_extension(CLAP_EXT_STATE) } as *mut clap_host_state;
-            instance.host_state.store(state, Ordering::Release);
-            let params = unsafe { instance.host_extension(CLAP_EXT_PARAMS) } as *const clap_host_params;
-            // Both host calls are thread-safe; `destroy` disconnects before the host may go away.
-            let (host, request_flush) = (instance.host as usize, unsafe { params.as_ref() }.and_then(|p| p.request_flush));
-            let request_callback = unsafe { instance.host.as_ref() }.and_then(|h| h.request_callback).filter(|_| !state.is_null());
-            instance.cx.connect(Box::new(move |wake| {
-                let request = match wake {
-                    Wake::Events => request_flush.filter(|_| !APPLYING.get()),
-                    Wake::Dirty => request_callback,
-                };
-                if let Some(request) = request {
-                    unsafe { request(host as *const clap_host) };
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                let latency = unsafe { instance.host_extension(CLAP_EXT_LATENCY) } as *mut clap_host_latency;
+                instance.host_latency.store(latency, Ordering::Release);
+                let state = unsafe { instance.host_extension(CLAP_EXT_STATE) } as *mut clap_host_state;
+                instance.host_state.store(state, Ordering::Release);
+                let params = unsafe { instance.host_extension(CLAP_EXT_PARAMS) } as *const clap_host_params;
+                // Both host calls are thread-safe; `destroy` disconnects before the host may go away.
+                let (host, request_flush) = (instance.host as usize, unsafe { params.as_ref() }.and_then(|p| p.request_flush));
+                let request_callback = unsafe { instance.host.as_ref() }.and_then(|h| h.request_callback).filter(|_| !state.is_null());
+                instance.cx.connect(Box::new(move |wake| {
+                    let request = match wake {
+                        Wake::Events => request_flush.filter(|_| !APPLYING.get()),
+                        Wake::Dirty => request_callback,
+                    };
+                    if let Some(request) = request {
+                        unsafe { request(host as *const clap_host) };
+                    }
+                }));
+                instance.shared.attach(instance.cx.clone());
+                let mut track = unsafe { instance.host_extension(CLAP_EXT_TRACK_INFO) };
+                if track.is_null() {
+                    track = unsafe { instance.host_extension(CLAP_EXT_TRACK_INFO_COMPAT) };
                 }
-            }));
-            instance.shared.attach(instance.cx.clone());
-            let mut track = unsafe { instance.host_extension(CLAP_EXT_TRACK_INFO) };
-            if track.is_null() {
-                track = unsafe { instance.host_extension(CLAP_EXT_TRACK_INFO_COMPAT) };
-            }
-            instance.host_track_info.store(track as *mut clap_host_track_info, Ordering::Release);
-            instance.read_track();
-            true
-        })
+                instance.host_track_info.store(track as *mut clap_host_track_info, Ordering::Release);
+                instance.read_track();
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
@@ -284,31 +286,39 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn activate(plugin: *const clap_plugin, sample_rate: f64, _min: u32, max: u32) -> bool {
-        Self::with(plugin, || false, |instance| {
-            if max == 0 || instance.active.load(Ordering::Acquire) {
-                return false;
-            }
-            instance.sample_rate.store(sample_rate.to_bits(), Ordering::Relaxed);
-            let inputs = instance.inputs.load(Ordering::Relaxed) as usize;
-            let latency = unsafe { instance.plugin_mut() }.activate(sample_rate, max as usize, inputs);
-            let previous = instance.latency.swap(latency, Ordering::AcqRel);
-            instance.active.store(true, Ordering::Release);
-            if previous != latency
-                && let Some(host_latency) = unsafe { instance.host_latency.load(Ordering::Acquire).as_ref() }
-                && let Some(changed) = host_latency.changed
-            {
-                unsafe { changed(instance.host) };
-            }
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                if max == 0 || instance.active.load(Ordering::Acquire) {
+                    return false;
+                }
+                instance.sample_rate.store(sample_rate.to_bits(), Ordering::Relaxed);
+                let inputs = instance.inputs.load(Ordering::Relaxed) as usize;
+                let latency = unsafe { instance.plugin_mut() }.activate(sample_rate, max as usize, inputs);
+                let previous = instance.latency.swap(latency, Ordering::AcqRel);
+                instance.active.store(true, Ordering::Release);
+                if previous != latency
+                    && let Some(host_latency) = unsafe { instance.host_latency.load(Ordering::Acquire).as_ref() }
+                    && let Some(changed) = host_latency.changed
+                {
+                    unsafe { changed(instance.host) };
+                }
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn deactivate(plugin: *const clap_plugin) {
-        Self::with(plugin, || (), |instance| {
-            if instance.active.swap(false, Ordering::AcqRel) {
-                unsafe { instance.plugin_mut() }.deactivate();
-            }
-        })
+        Self::with(
+            plugin,
+            || (),
+            |instance| {
+                if instance.active.swap(false, Ordering::AcqRel) {
+                    unsafe { instance.plugin_mut() }.deactivate();
+                }
+            },
+        )
     }
 
     unsafe extern "C" fn start_processing(plugin: *const clap_plugin) -> bool {
@@ -320,32 +330,40 @@ impl<P: Plugin> Instance<P> {
     unsafe extern "C" fn reset(_: *const clap_plugin) {}
 
     unsafe extern "C" fn on_main_thread(plugin: *const clap_plugin) {
-        Self::with(plugin, || (), |instance| {
-            if instance.cx.take_dirty()
-                && let Some(mark_dirty) = unsafe { instance.host_state.load(Ordering::Acquire).as_ref() }.and_then(|s| s.mark_dirty)
-            {
-                unsafe { mark_dirty(instance.host) };
-            }
-        })
+        Self::with(
+            plugin,
+            || (),
+            |instance| {
+                if instance.cx.take_dirty()
+                    && let Some(mark_dirty) = unsafe { instance.host_state.load(Ordering::Acquire).as_ref() }.and_then(|s| s.mark_dirty)
+                {
+                    unsafe { mark_dirty(instance.host) };
+                }
+            },
+        )
     }
 
     unsafe extern "C" fn process(plugin: *const clap_plugin, process: *const clap_process) -> clap_process_status {
-        Self::with(plugin, || CLAP_PROCESS_ERROR, |instance| unsafe {
-            if process.is_null() || !instance.active.load(Ordering::Acquire) {
-                return CLAP_PROCESS_ERROR;
-            }
-            let process = &*process;
-            instance.apply(process.in_events);
-            let status = instance.run(process);
-            instance.send(process.out_events);
-            if instance.plugin_mut().take_latency_changed()
-                && let Some(host) = instance.host.as_ref()
-                && let Some(restart) = host.request_restart
-            {
-                restart(instance.host);
-            }
-            status
-        })
+        Self::with(
+            plugin,
+            || CLAP_PROCESS_ERROR,
+            |instance| unsafe {
+                if process.is_null() || !instance.active.load(Ordering::Acquire) {
+                    return CLAP_PROCESS_ERROR;
+                }
+                let process = &*process;
+                instance.apply(process.in_events);
+                let status = instance.run(process);
+                instance.send(process.out_events);
+                if instance.plugin_mut().take_latency_changed()
+                    && let Some(host) = instance.host.as_ref()
+                    && let Some(restart) = host.request_restart
+                {
+                    restart(instance.host);
+                }
+                status
+            },
+        )
     }
 
     /// The audio thread has `plugin` to itself while active, which makes `plugin_mut` sound here.
@@ -499,69 +517,89 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn param_info(plugin: *const clap_plugin, index: u32, out: *mut clap_param_info) -> bool {
-        Self::with(plugin, || false, |instance| {
-            let Some(info) = instance.shared.params().get(index as usize) else { return false };
-            if out.is_null() {
-                return false;
-            }
-            let mut flags = if matches!(info.kind, Kind::Float { .. }) { 0 } else { CLAP_PARAM_IS_STEPPED };
-            if info.automatable {
-                flags |= CLAP_PARAM_IS_AUTOMATABLE;
-            }
-            let mut clap = clap_param_info {
-                id: info.id,
-                flags,
-                cookie: ptr::null_mut(),
-                name: [0; _],
-                module: [0; _],
-                min_value: info.min(),
-                max_value: info.max(),
-                default_value: info.default,
-            };
-            copy_str(info.name, &mut clap.name);
-            unsafe { out.write(clap) };
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                let Some(info) = instance.shared.params().get(index as usize) else { return false };
+                if out.is_null() {
+                    return false;
+                }
+                let mut flags = if matches!(info.kind, Kind::Float { .. }) { 0 } else { CLAP_PARAM_IS_STEPPED };
+                if info.automatable {
+                    flags |= CLAP_PARAM_IS_AUTOMATABLE;
+                }
+                let mut clap = clap_param_info {
+                    id: info.id,
+                    flags,
+                    cookie: ptr::null_mut(),
+                    name: [0; _],
+                    module: [0; _],
+                    min_value: info.min(),
+                    max_value: info.max(),
+                    default_value: info.default,
+                };
+                copy_str(info.name, &mut clap.name);
+                unsafe { out.write(clap) };
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn param_value(plugin: *const clap_plugin, id: clap_id, out: *mut f64) -> bool {
-        Self::with(plugin, || false, |instance| {
-            if out.is_null() || instance.info(id).is_none() {
-                return false;
-            }
-            unsafe { out.write(instance.shared.param(id)) };
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                if out.is_null() || instance.info(id).is_none() {
+                    return false;
+                }
+                unsafe { out.write(instance.shared.param(id)) };
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn value_to_text(plugin: *const clap_plugin, id: clap_id, value: f64, out: *mut c_char, capacity: u32) -> bool {
-        Self::with(plugin, || false, |instance| {
-            if out.is_null() || capacity == 0 || instance.info(id).is_none() {
-                return false;
-            }
-            let out = unsafe { std::slice::from_raw_parts_mut(out, capacity as usize) };
-            copy_str(&instance.shared.param_text(id, value), out);
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                if out.is_null() || capacity == 0 || instance.info(id).is_none() {
+                    return false;
+                }
+                let out = unsafe { std::slice::from_raw_parts_mut(out, capacity as usize) };
+                copy_str(&instance.shared.param_text(id, value), out);
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn text_to_value(plugin: *const clap_plugin, id: clap_id, text: *const c_char, out: *mut f64) -> bool {
-        Self::with(plugin, || false, |instance| {
-            if text.is_null() || out.is_null() || instance.info(id).is_none() {
-                return false;
-            }
-            let Ok(text) = unsafe { CStr::from_ptr(text) }.to_str() else { return false };
-            let Some(value) = instance.shared.param_from_text(id, text) else { return false };
-            unsafe { out.write(value) };
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                if text.is_null() || out.is_null() || instance.info(id).is_none() {
+                    return false;
+                }
+                let Ok(text) = unsafe { CStr::from_ptr(text) }.to_str() else { return false };
+                let Some(value) = instance.shared.param_from_text(id, text) else { return false };
+                unsafe { out.write(value) };
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn flush(plugin: *const clap_plugin, events: *const clap_input_events, out: *const clap_output_events) {
-        Self::with(plugin, || (), |instance| {
-            instance.apply(events);
-            instance.send(out);
-        })
+        Self::with(
+            plugin,
+            || (),
+            |instance| {
+                instance.apply(events);
+                instance.send(out);
+            },
+        )
     }
 
     /// What the editor did, for as much as the host takes; the rest goes with the next call.
@@ -595,42 +633,50 @@ impl<P: Plugin> Instance<P> {
     const STATE: clap_plugin_state = clap_plugin_state { save: Some(Self::save), load: Some(Self::load) };
 
     unsafe extern "C" fn save(plugin: *const clap_plugin, stream: *const clap_ostream) -> bool {
-        Self::with(plugin, || false, |instance| unsafe {
-            let Some(write) = stream.as_ref().and_then(|s| s.write) else { return false };
-            let bytes = instance.shared.save();
-            let mut rest = &bytes[..];
-            while !rest.is_empty() {
-                let written = write(stream, rest.as_ptr() as *const c_void, rest.len() as u64);
-                if written <= 0 {
-                    return false;
+        Self::with(
+            plugin,
+            || false,
+            |instance| unsafe {
+                let Some(write) = stream.as_ref().and_then(|s| s.write) else { return false };
+                let bytes = instance.shared.save();
+                let mut rest = &bytes[..];
+                while !rest.is_empty() {
+                    let written = write(stream, rest.as_ptr() as *const c_void, rest.len() as u64);
+                    if written <= 0 {
+                        return false;
+                    }
+                    rest = &rest[(written as usize).min(rest.len())..];
                 }
-                rest = &rest[(written as usize).min(rest.len())..];
-            }
-            true
-        })
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn load(plugin: *const clap_plugin, stream: *const clap_istream) -> bool {
-        Self::with(plugin, || false, |instance| unsafe {
-            let Some(read) = stream.as_ref().and_then(|s| s.read) else { return false };
-            let mut bytes = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let got = read(stream, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u64);
-                if got < 0 {
+        Self::with(
+            plugin,
+            || false,
+            |instance| unsafe {
+                let Some(read) = stream.as_ref().and_then(|s| s.read) else { return false };
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let got = read(stream, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u64);
+                    if got < 0 {
+                        return false;
+                    }
+                    if got == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..(got as usize).min(chunk.len())]);
+                }
+                if !instance.shared.load(&bytes) {
                     return false;
                 }
-                if got == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&chunk[..(got as usize).min(chunk.len())]);
-            }
-            if !instance.shared.load(&bytes) {
-                return false;
-            }
-            instance.rescan_values();
-            true
-        })
+                instance.rescan_values();
+                true
+            },
+        )
     }
 
     /// Null when the host lacks the extension.
@@ -665,29 +711,40 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn port(plugin: *const clap_plugin, index: u32, is_input: bool, out: *mut clap_audio_port_info) -> bool {
-        Self::with(plugin, || false, |instance| {
-            if out.is_null() || index > (is_input && P::INFO.sidechain) as u32 {
-                return false;
-            }
-            if index == 1 {
-                let mut info = clap_audio_port_info { id: 1, name: [0; _], flags: 0, channel_count: 2, port_type: CLAP_PORT_STEREO.as_ptr(), in_place_pair: CLAP_INVALID_ID };
-                copy_str("Sidechain", &mut info.name);
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                if out.is_null() || index > (is_input && P::INFO.sidechain) as u32 {
+                    return false;
+                }
+                if index == 1 {
+                    let mut info = clap_audio_port_info {
+                        id: 1,
+                        name: [0; _],
+                        flags: 0,
+                        channel_count: 2,
+                        port_type: CLAP_PORT_STEREO.as_ptr(),
+                        in_place_pair: CLAP_INVALID_ID,
+                    };
+                    copy_str("Sidechain", &mut info.name);
+                    unsafe { out.write(info) };
+                    return true;
+                }
+                let channels = if is_input { instance.inputs.load(Ordering::Relaxed) } else { 2 };
+                let mut info = clap_audio_port_info {
+                    id: 0,
+                    name: [0; _],
+                    flags: CLAP_AUDIO_PORT_IS_MAIN,
+                    channel_count: channels,
+                    port_type: port_type(channels),
+                    in_place_pair: CLAP_INVALID_ID,
+                };
+                copy_str(if is_input { "Input" } else { "Output" }, &mut info.name);
                 unsafe { out.write(info) };
-                return true;
-            }
-            let channels = if is_input { instance.inputs.load(Ordering::Relaxed) } else { 2 };
-            let mut info = clap_audio_port_info {
-                id: 0,
-                name: [0; _],
-                flags: CLAP_AUDIO_PORT_IS_MAIN,
-                channel_count: channels,
-                port_type: port_type(channels),
-                in_place_pair: CLAP_INVALID_ID,
-            };
-            copy_str(if is_input { "Input" } else { "Output" }, &mut info.name);
-            unsafe { out.write(info) };
-            true
-        })
+                true
+            },
+        )
     }
 
     const AUDIO_PORTS_CONFIG: clap_plugin_audio_ports_config =
@@ -722,14 +779,18 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn select(plugin: *const clap_plugin, id: clap_id) -> bool {
-        Self::with(plugin, || false, |instance| {
-            let Some(&Layout { main_inputs: inputs, .. }) = P::LAYOUTS.get(id as usize) else { return false };
-            if instance.active.load(Ordering::Acquire) {
-                return false;
-            }
-            instance.inputs.store(inputs, Ordering::Relaxed);
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                let Some(&Layout { main_inputs: inputs, .. }) = P::LAYOUTS.get(id as usize) else { return false };
+                if instance.active.load(Ordering::Acquire) {
+                    return false;
+                }
+                instance.inputs.store(inputs, Ordering::Relaxed);
+                true
+            },
+        )
     }
 
     const GUI: clap_plugin_gui = clap_plugin_gui {
@@ -774,23 +835,31 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn gui_create(plugin: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
-        Self::with(plugin, || false, |instance| {
-            let Ok(mut gui) = instance.gui.try_lock() else { return false };
-            if !supported(api, floating) {
-                return false;
-            }
-            instance.close(&mut gui);
-            *gui = Gui { created: true, ..Gui::new::<P>(&instance.shared) };
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                let Ok(mut gui) = instance.gui.try_lock() else { return false };
+                if !supported(api, floating) {
+                    return false;
+                }
+                instance.close(&mut gui);
+                *gui = Gui { created: true, ..Gui::new::<P>(&instance.shared) };
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn gui_destroy(plugin: *const clap_plugin) {
-        Self::with(plugin, || (), |instance| {
-            let Ok(mut gui) = instance.gui.try_lock() else { return };
-            instance.close(&mut gui);
-            *gui = Gui::new::<P>(&instance.shared);
-        })
+        Self::with(
+            plugin,
+            || (),
+            |instance| {
+                let Ok(mut gui) = instance.gui.try_lock() else { return };
+                instance.close(&mut gui);
+                *gui = Gui::new::<P>(&instance.shared);
+            },
+        )
     }
 
     /// Drops the window first: on Linux that waits for the window's thread, which may be asking the
@@ -803,26 +872,31 @@ impl<P: Plugin> Instance<P> {
     /// X11 and Win32 sizes are physical pixels, so the scale applies to both. Cocoa's are points, for
     /// which CLAP has the host not set one.
     unsafe extern "C" fn gui_set_scale(plugin: *const clap_plugin, scale: f64) -> bool {
-        Self::with(plugin, || false, |instance| {
-            if !editor::HOST_SCALE {
-                return false;
-            }
-            let Ok(gui) = instance.gui.try_lock() else { return false };
-            let before = gui.geometry.physical();
-            if !gui.geometry.set_scale(scale) {
-                return false;
-            }
-            let (width, height) = gui.geometry.physical();
-            let open = gui.window.is_some();
-            // The host may answer the request with `set_size` before it returns.
-            drop(gui);
-            if open && (width, height) != before
-                && let Some(request_resize) = instance.host_request_resize()
-            {
-                unsafe { request_resize(instance.host, width, height) };
-            }
-            true
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                if !editor::HOST_SCALE {
+                    return false;
+                }
+                let Ok(gui) = instance.gui.try_lock() else { return false };
+                let before = gui.geometry.physical();
+                if !gui.geometry.set_scale(scale) {
+                    return false;
+                }
+                let (width, height) = gui.geometry.physical();
+                let open = gui.window.is_some();
+                // The host may answer the request with `set_size` before it returns.
+                drop(gui);
+                if open
+                    && (width, height) != before
+                    && let Some(request_resize) = instance.host_request_resize()
+                {
+                    unsafe { request_resize(instance.host, width, height) };
+                }
+                true
+            },
+        )
     }
 
     fn host_request_resize(&self) -> Option<unsafe extern "C" fn(*const clap_host, u32, u32) -> bool> {
@@ -831,17 +905,21 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn gui_size(plugin: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
-        Self::with_gui(plugin, || false, |gui| {
-            if width.is_null() || height.is_null() {
-                return false;
-            }
-            let size = gui.geometry.physical();
-            unsafe {
-                width.write(size.0);
-                height.write(size.1);
-            }
-            true
-        })
+        Self::with_gui(
+            plugin,
+            || false,
+            |gui| {
+                if width.is_null() || height.is_null() {
+                    return false;
+                }
+                let size = gui.geometry.physical();
+                unsafe {
+                    width.write(size.0);
+                    height.write(size.1);
+                }
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn gui_can_resize(_: *const clap_plugin) -> bool {
@@ -866,50 +944,62 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn gui_adjust_size(plugin: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
-        Self::with_gui(plugin, || false, |gui| {
-            if width.is_null() || height.is_null() {
-                return false;
-            }
-            let size = gui.geometry.fit_physical(unsafe { (width.read(), height.read()) });
-            unsafe {
-                width.write(size.0);
-                height.write(size.1);
-            }
-            true
-        })
+        Self::with_gui(
+            plugin,
+            || false,
+            |gui| {
+                if width.is_null() || height.is_null() {
+                    return false;
+                }
+                let size = gui.geometry.fit_physical(unsafe { (width.read(), height.read()) });
+                unsafe {
+                    width.write(size.0);
+                    height.write(size.1);
+                }
+                true
+            },
+        )
     }
 
     /// Only a size `adjust_size` would leave as it is.
     unsafe extern "C" fn gui_set_size(plugin: *const clap_plugin, width: u32, height: u32) -> bool {
-        Self::with_gui(plugin, || false, |gui| {
-            if gui.geometry.fit_physical((width, height)) != (width, height) {
-                return false;
-            }
-            gui.geometry.resize_physical((width, height));
-            true
-        })
+        Self::with_gui(
+            plugin,
+            || false,
+            |gui| {
+                if gui.geometry.fit_physical((width, height)) != (width, height) {
+                    return false;
+                }
+                gui.geometry.resize_physical((width, height));
+                true
+            },
+        )
     }
 
     unsafe extern "C" fn gui_set_parent(plugin: *const clap_plugin, window: *const clap_window) -> bool {
-        Self::with(plugin, || false, |instance| {
-            let Ok(mut gui) = instance.gui.try_lock() else { return false };
-            let Some(window) = (unsafe { window.as_ref() }) else { return false };
-            if !gui.created || !supported(window.api, false) {
-                return false;
-            }
-            #[cfg(target_os = "windows")]
-            let parent = Parent::Win32(unsafe { window.specific.win32 });
-            #[cfg(target_os = "macos")]
-            let parent = Parent::AppKit(unsafe { window.specific.cocoa });
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            let parent = Parent::X11(unsafe { window.specific.x11 });
-            instance.close(&mut gui);
-            gui.window = editor::open(parent, gui.geometry.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
-            if gui.window.is_some() && P::RESIZABLE {
-                instance.connect_resize(gui.geometry.clone());
-            }
-            gui.window.is_some()
-        })
+        Self::with(
+            plugin,
+            || false,
+            |instance| {
+                let Ok(mut gui) = instance.gui.try_lock() else { return false };
+                let Some(window) = (unsafe { window.as_ref() }) else { return false };
+                if !gui.created || !supported(window.api, false) {
+                    return false;
+                }
+                #[cfg(target_os = "windows")]
+                let parent = Parent::Win32(unsafe { window.specific.win32 });
+                #[cfg(target_os = "macos")]
+                let parent = Parent::AppKit(unsafe { window.specific.cocoa });
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                let parent = Parent::X11(unsafe { window.specific.x11 });
+                instance.close(&mut gui);
+                gui.window = editor::open(parent, gui.geometry.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
+                if gui.window.is_some() && P::RESIZABLE {
+                    instance.connect_resize(gui.geometry.clone());
+                }
+                gui.window.is_some()
+            },
+        )
     }
 
     /// The host's `request_resize` is thread-safe, so the editor asks it from its own thread.
@@ -1261,7 +1351,8 @@ mod tests {
         !REFUSE.load(Ordering::SeqCst)
     }
 
-    static HOST_GUI: clap_host_gui = clap_host_gui { resize_hints_changed: None, request_resize: Some(request_resize), request_show: None, request_hide: None, closed: None };
+    static HOST_GUI: clap_host_gui =
+        clap_host_gui { resize_hints_changed: None, request_resize: Some(request_resize), request_show: None, request_hide: None, closed: None };
 
     unsafe extern "C" fn host_gui(_: *const clap_host, id: *const c_char) -> *const c_void {
         if same(id, CLAP_EXT_GUI) { &HOST_GUI as *const _ as *const c_void } else { ptr::null() }

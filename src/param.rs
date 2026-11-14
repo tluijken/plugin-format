@@ -7,11 +7,21 @@ pub enum Map {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
-    Int { min: i32, max: i32 },
+    Int {
+        min: i32,
+        max: i32,
+    },
     /// An integer the host should offer as a list of its texts rather than as a number.
-    List { min: i32, max: i32 },
+    List {
+        min: i32,
+        max: i32,
+    },
     Bool,
-    Float { min: f64, max: f64, map: Map },
+    Float {
+        min: f64,
+        max: f64,
+        map: Map,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

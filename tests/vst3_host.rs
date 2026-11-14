@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use gain::{FREQUENCY, GAIN, TEST_GESTURE};
-use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
 use vst3::Steinberg::Vst::ChannelContext::{IInfoListener, IInfoListenerTrait, kChannelColorKey, kChannelNameKey};
+use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
 use vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
 use vst3::Steinberg::Vst::*;
@@ -115,8 +115,16 @@ impl Instance {
         unsafe {
             let mut in_ptrs: Vec<*mut f32> = inputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
             let mut out_ptrs: Vec<*mut f32> = outputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
-            let mut input = AudioBusBuffers { numChannels: inputs.len() as i32, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: in_ptrs.as_mut_ptr() } };
-            let mut output = AudioBusBuffers { numChannels: outputs.len() as i32, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: out_ptrs.as_mut_ptr() } };
+            let mut input = AudioBusBuffers {
+                numChannels: inputs.len() as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 { channelBuffers32: in_ptrs.as_mut_ptr() },
+            };
+            let mut output = AudioBusBuffers {
+                numChannels: outputs.len() as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 { channelBuffers32: out_ptrs.as_mut_ptr() },
+            };
             let mut data = ProcessData {
                 processMode: 0,
                 symbolicSampleSize: kSample32 as i32,

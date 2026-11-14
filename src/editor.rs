@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use egui_baseview::baseview;
 use egui_baseview::baseview::dpi::NativeSize;

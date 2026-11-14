@@ -6,20 +6,20 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
+#[cfg(target_os = "linux")]
+use vst3::Steinberg::Linux::IRunLoopTrait;
 use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
 use vst3::Steinberg::Vst::BusInfo_::BusFlags_::kDefaultActive;
 use vst3::Steinberg::Vst::BusTypes_::{kAux, kMain};
+use vst3::Steinberg::Vst::IProcessContextRequirements_::Flags_::kNeedTransportState;
 use vst3::Steinberg::Vst::MediaTypes_::kAudio;
 use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
-use vst3::Steinberg::Vst::IProcessContextRequirements_::Flags_::kNeedTransportState;
 use vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kPlaying;
 use vst3::Steinberg::Vst::RestartFlags_::{kLatencyChanged, kParamValuesChanged};
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
-#[cfg(target_os = "linux")]
-use vst3::Steinberg::Linux::IRunLoopTrait;
 
 use crate::editor::{self, Parent};
 use crate::gui_context::Event;
@@ -732,7 +732,11 @@ impl<P: Plugin> ChannelContext::IInfoListenerTrait for Component<P> {
                 String::from_utf16_lossy(&units)
             });
             let mut argb = 0i64;
-            let color = (unsafe { list.getInt(ChannelContext::kChannelColorKey, &mut argb) } == kResultOk).then_some([(argb >> 16) as u8, (argb >> 8) as u8, argb as u8]);
+            let color = (unsafe { list.getInt(ChannelContext::kChannelColorKey, &mut argb) } == kResultOk).then_some([
+                (argb >> 16) as u8,
+                (argb >> 8) as u8,
+                argb as u8,
+            ]);
             self.host.cx.set_track(TrackInfo { name, color });
             kResultOk
         })

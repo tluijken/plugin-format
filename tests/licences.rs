@@ -73,39 +73,16 @@ fn metadata(target: &str) -> Value {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo metadata");
-    assert!(
-        output.status.success(),
-        "cargo metadata failed for {target}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "cargo metadata failed for {target}: {}", String::from_utf8_lossy(&output.stderr));
     serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
 }
 
 fn shipped_offenders(meta: &Value) -> BTreeSet<String> {
-    let packages: BTreeMap<&str, &Value> = meta["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| (p["id"].as_str().unwrap(), p))
-        .collect();
-    let workspace: BTreeSet<&str> = meta["workspace_members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|id| id.as_str().unwrap())
-        .collect();
-    let nodes: BTreeMap<&str, &Value> = meta["resolve"]["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|n| (n["id"].as_str().unwrap(), n))
-        .collect();
+    let packages: BTreeMap<&str, &Value> = meta["packages"].as_array().unwrap().iter().map(|p| (p["id"].as_str().unwrap(), p)).collect();
+    let workspace: BTreeSet<&str> = meta["workspace_members"].as_array().unwrap().iter().map(|id| id.as_str().unwrap()).collect();
+    let nodes: BTreeMap<&str, &Value> = meta["resolve"]["nodes"].as_array().unwrap().iter().map(|n| (n["id"].as_str().unwrap(), n)).collect();
 
-    let root = *packages
-        .iter()
-        .find(|(_, p)| p["name"] == "gain")
-        .expect("gain package")
-        .0;
+    let root = *packages.iter().find(|(_, p)| p["name"] == "gain").expect("gain package").0;
 
     let mut seen = BTreeSet::new();
     let mut stack = vec![root];
@@ -114,11 +91,7 @@ fn shipped_offenders(meta: &Value) -> BTreeSet<String> {
             continue;
         }
         for dep in nodes[id]["deps"].as_array().unwrap() {
-            let ships = dep["dep_kinds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|k| k["kind"].is_null() || k["kind"] == "build");
+            let ships = dep["dep_kinds"].as_array().unwrap().iter().any(|k| k["kind"].is_null() || k["kind"] == "build");
             if ships {
                 stack.push(dep["pkg"].as_str().unwrap());
             }

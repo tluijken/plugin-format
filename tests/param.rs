@@ -3,7 +3,9 @@ use plugin_format::{Kind, Map, ParamInfo};
 #[test]
 fn every_int_value_survives_normalising_and_back() {
     let p = ParamInfo { id: 0, name: "Pedal preset", kind: Kind::Int { min: 0, max: 126 }, default: 0.0, automatable: false };
-    for v in 0..=126 { assert_eq!(p.plain(p.normalise(v as f64)), v as f64); }
+    for v in 0..=126 {
+        assert_eq!(p.plain(p.normalise(v as f64)), v as f64);
+    }
     assert_eq!(p.step_count(), 126);
 }
 
