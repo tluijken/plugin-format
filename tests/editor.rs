@@ -1,5 +1,5 @@
 //! Opens the editor in a real window as a CLAP host does, again and again. Needs a display: on
-//! Linux an X server such as Xvfb, else the test is skipped.
+//! Linux an X server such as Xvfb, else the test is skipped; in CI (`CI` set) it fails instead.
 
 use std::ptr;
 use std::sync::Arc;
@@ -231,6 +231,7 @@ unsafe fn open_and_close(plugin: *const clap_plugin, gui: &clap_plugin_gui, pare
 #[test]
 fn editor_opens_and_closes_fifty_times() {
     let Some(parent) = platform::Parent::new() else {
+        assert!(std::env::var_os("CI").is_none(), "no display to open the editor on");
         eprintln!("skipped: no display to open the editor on");
         return;
     };
