@@ -110,6 +110,7 @@ pub const fn entry<P: Plugin>() -> clap_plugin_entry {
 /// # Safety
 ///
 /// `plugin` is null or a live plugin instance, and one this library made is an instance of `P`.
+#[doc(hidden)]
 pub unsafe fn editor<P: Plugin>(plugin: *const clap_plugin) -> Option<crate::Editor> {
     if !ptr::eq(unsafe { plugin.as_ref() }?.desc, descriptor::<P>()) {
         return None;
