@@ -12,7 +12,7 @@ use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, clap_event_param_value, clap_input_events, clap_output_events};
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
-use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_plugin_gui, clap_window};
+use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
@@ -598,7 +598,8 @@ impl<P: Plugin> Instance<P> {
             if !supported(api, floating) {
                 return false;
             }
-            *gui = Gui { created: true, window: None };
+            gui.window = None;
+            gui.created = true;
             true
         })
     }
@@ -607,19 +608,37 @@ impl<P: Plugin> Instance<P> {
         Self::with_gui(plugin, || (), |gui| *gui = Gui::default())
     }
 
-    /// The window reads the scale from the system.
-    unsafe extern "C" fn gui_set_scale(_: *const clap_plugin, _: f64) -> bool {
-        false
+    /// X11 and Win32 sizes are physical pixels, so the scale applies to both.
+    unsafe extern "C" fn gui_set_scale(plugin: *const clap_plugin, scale: f64) -> bool {
+        Self::with(plugin, || false, |instance| {
+            let Ok(gui) = instance.gui.try_lock() else { return false };
+            let before = gui.scale.of(P::EDITOR_SIZE);
+            if !gui.scale.set(scale) {
+                return false;
+            }
+            let (width, height) = gui.scale.of(P::EDITOR_SIZE);
+            let open = gui.window.is_some();
+            // The host may answer the request with `set_size` before it returns.
+            drop(gui);
+            if open && (width, height) != before {
+                let host_gui = unsafe { instance.host_extension(CLAP_EXT_GUI) } as *const clap_host_gui;
+                if let Some(request_resize) = unsafe { host_gui.as_ref() }.and_then(|g| g.request_resize) {
+                    unsafe { request_resize(instance.host, width, height) };
+                }
+            }
+            true
+        })
     }
 
-    unsafe extern "C" fn gui_size(_: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
-        guard(false, || {
+    unsafe extern "C" fn gui_size(plugin: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
+        Self::with_gui(plugin, || false, |gui| {
             if width.is_null() || height.is_null() {
                 return false;
             }
+            let size = gui.scale.of(P::EDITOR_SIZE);
             unsafe {
-                width.write(P::EDITOR_SIZE.0);
-                height.write(P::EDITOR_SIZE.1);
+                width.write(size.0);
+                height.write(size.1);
             }
             true
         })
@@ -633,8 +652,8 @@ impl<P: Plugin> Instance<P> {
         false
     }
 
-    unsafe extern "C" fn gui_set_size(_: *const clap_plugin, width: u32, height: u32) -> bool {
-        (width, height) == P::EDITOR_SIZE
+    unsafe extern "C" fn gui_set_size(plugin: *const clap_plugin, width: u32, height: u32) -> bool {
+        Self::with_gui(plugin, || false, |gui| (width, height) == gui.scale.of(P::EDITOR_SIZE))
     }
 
     unsafe extern "C" fn gui_set_parent(plugin: *const clap_plugin, window: *const clap_window) -> bool {
@@ -649,7 +668,7 @@ impl<P: Plugin> Instance<P> {
             #[cfg(not(target_os = "windows"))]
             let parent = Parent::X11(unsafe { window.specific.x11 });
             gui.window = None;
-            gui.window = editor::open(parent, P::EDITOR_SIZE, instance.shared.editor(), Box::new(|| {}));
+            gui.window = editor::open(parent, P::EDITOR_SIZE, gui.scale.clone(), instance.shared.editor(), Box::new(|| {}));
             gui.window.is_some()
         })
     }
@@ -693,6 +712,7 @@ fn supported(api: *const c_char, floating: bool) -> bool {
 struct Gui {
     created: bool,
     window: Option<editor::Window>,
+    scale: editor::Scale,
 }
 
 #[cfg(test)]

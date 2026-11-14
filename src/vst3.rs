@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
@@ -663,7 +663,10 @@ impl<P: Plugin> IEditControllerTrait for Component<P> {
             if name.is_null() || unsafe { CStr::from_ptr(name) } != c"editor" {
                 return ptr::null_mut();
             }
-            ComWrapper::new(View::<P>::new(self)).to_com_ptr::<IPlugView>().map_or(ptr::null_mut(), ComPtr::into_raw)
+            let view = ComWrapper::new(View::<P>::new(self));
+            let Some(plug_view) = view.to_com_ptr::<IPlugView>() else { return ptr::null_mut() };
+            view.this.store(plug_view.as_ptr(), Ordering::Release);
+            plug_view.into_raw()
         })
     }
 }
@@ -689,10 +692,13 @@ struct View<P: Plugin> {
     timer: Mutex<Option<Timer>>,
     window: Mutex<Option<editor::Window>>,
     frame: Mutex<Option<ComPtr<IPlugFrame>>>,
+    scale: editor::Scale,
+    /// This view as the host holds it, for `resizeView`; not a reference, so it does not keep itself alive.
+    this: AtomicPtr<IPlugView>,
 }
 
 impl<P: Plugin> Class for View<P> {
-    type Interfaces = (IPlugView,);
+    type Interfaces = (IPlugView, IPlugViewContentScaleSupport);
 }
 
 impl<P: Plugin> View<P> {
@@ -704,6 +710,8 @@ impl<P: Plugin> View<P> {
             timer: Mutex::new(None),
             window: Mutex::new(None),
             frame: Mutex::new(None),
+            scale: editor::Scale::default(),
+            this: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -720,7 +728,7 @@ impl<P: Plugin> View<P> {
         };
         #[cfg(not(target_os = "windows"))]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = (Parent::X11(parent as usize as std::ffi::c_ulong), Box::new(|| {}));
-        *window = editor::open(parent, P::EDITOR_SIZE, self.shared.editor(), on_frame);
+        *window = editor::open(parent, P::EDITOR_SIZE, self.scale.clone(), self.shared.editor(), on_frame);
         if window.is_none() {
             return kResultFalse;
         }
@@ -822,7 +830,7 @@ impl<P: Plugin> IPlugViewTrait for View<P> {
             if size.is_null() {
                 return kInvalidArgument;
             }
-            let (width, height) = P::EDITOR_SIZE;
+            let (width, height) = self.scale.of(P::EDITOR_SIZE);
             unsafe { size.write(ViewRect { left: 0, top: 0, right: width as int32, bottom: height as int32 }) };
             kResultOk
         })
@@ -831,7 +839,7 @@ impl<P: Plugin> IPlugViewTrait for View<P> {
     unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
         guard(kInternalError, || {
             let Some(rect) = (unsafe { new_size.as_ref() }) else { return kInvalidArgument };
-            let (width, height) = P::EDITOR_SIZE;
+            let (width, height) = self.scale.of(P::EDITOR_SIZE);
             if (rect.right - rect.left, rect.bottom - rect.top) == (width as int32, height as int32) { kResultOk } else { kResultFalse }
         })
     }
@@ -855,9 +863,29 @@ impl<P: Plugin> IPlugViewTrait for View<P> {
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         guard(kInternalError, || {
             let Some(rect) = (unsafe { rect.as_mut() }) else { return kInvalidArgument };
-            let (width, height) = P::EDITOR_SIZE;
+            let (width, height) = self.scale.of(P::EDITOR_SIZE);
             rect.right = rect.left + width as int32;
             rect.bottom = rect.top + height as int32;
+            kResultTrue
+        })
+    }
+}
+
+impl<P: Plugin> IPlugViewContentScaleSupportTrait for View<P> {
+    unsafe fn setContentScaleFactor(&self, factor: IPlugViewContentScaleSupport_::ScaleFactor) -> tresult {
+        guard(kInternalError, || {
+            let before = self.scale.of(P::EDITOR_SIZE);
+            if !self.scale.set(factor as f64) {
+                return kResultFalse;
+            }
+            let (width, height) = self.scale.of(P::EDITOR_SIZE);
+            let open = self.window.try_lock().is_ok_and(|window| window.is_some());
+            let frame = self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let this = self.this.load(Ordering::Acquire);
+            if open && (width, height) != before && !this.is_null() && let Some(frame) = frame {
+                let mut rect = ViewRect { left: 0, top: 0, right: width as int32, bottom: height as int32 };
+                unsafe { frame.resizeView(this, &mut rect) };
+            }
             kResultTrue
         })
     }
