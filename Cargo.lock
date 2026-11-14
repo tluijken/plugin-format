@@ -1329,6 +1329,8 @@ dependencies = [
  "serde_json",
  "sidechain",
  "vst3",
+ "windows-sys 0.61.2",
+ "x11rb",
 ]
 
 [[package]]

@@ -57,6 +57,13 @@ pub trait Shared: Send + Sync + 'static {
     /// What the host says about the track, once the host is known and whenever it changes. Called on
     /// the host's main thread.
     fn set_track(&self, _info: TrackInfo) {}
+    /// The size, at a scale of 1.0, to open a `Plugin::RESIZABLE` editor at instead of
+    /// `Plugin::EDITOR_SIZE`. Asked each time the host opens the editor.
+    fn editor_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// The size, at a scale of 1.0, the editor was resized to, for `editor_size` to give back.
+    fn set_editor_size(&self, _width: u32, _height: u32) {}
 }
 
 /// What the host says about the track the plugin is on.
@@ -69,7 +76,12 @@ pub struct TrackInfo {
 /// The audio half, which the wrapper only ever uses from one thread at a time.
 pub trait Plugin: Send + Sized + 'static {
     const INFO: Info;
+    /// The editor's size at a scale of 1.0; for a `RESIZABLE` one, the size it starts at.
     const EDITOR_SIZE: (u32, u32);
+    /// Whether the host may resize the editor, and the editor may ask the host to.
+    const RESIZABLE: bool = false;
+    /// The smallest size, at a scale of 1.0, a `RESIZABLE` editor takes.
+    const EDITOR_MIN: (u32, u32) = Self::EDITOR_SIZE;
     type Shared: Shared;
     fn new() -> (Self, std::sync::Arc<Self::Shared>);
     /// `inputs` is the main input bus the host chose: 1 (mono in, stereo out) or 2 (stereo/stereo).

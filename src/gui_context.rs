@@ -11,7 +11,14 @@ pub struct GuiContext(Arc<Channel>);
 
 impl GuiContext {
     pub(crate) fn new(shared: Weak<dyn Shared>) -> Self {
-        GuiContext(Arc::new(Channel { shared, queue: Queue::default(), dirty: AtomicBool::new(false), wake: RwLock::new(None), track: Mutex::new(None) }))
+        GuiContext(Arc::new(Channel {
+            shared,
+            queue: Queue::default(),
+            dirty: AtomicBool::new(false),
+            wake: RwLock::new(None),
+            resize: RwLock::new(None),
+            track: Mutex::new(None),
+        }))
     }
 
     /// Starts a gesture on `id`, e.g. when a drag begins, so the host groups what follows into one undo step.
@@ -41,9 +48,12 @@ impl GuiContext {
         self.0.wake(Wake::Dirty);
     }
 
-    /// Asks the host to resize the editor to `w` by `h` at a scale of 1.0; false when it refuses.
-    pub fn request_resize(&self, _w: u32, _h: u32) -> bool {
-        false
+    /// Asks the host to resize the open editor to `w` by `h` at a scale of 1.0, or to its minimum where
+    /// that is larger. False when the editor is not resizable or not open, or the host refused. The
+    /// editor takes the new size by the next frame, or once the host resized it: a VST3 host is asked
+    /// on its UI thread, so it may still refuse after this returned true.
+    pub fn request_resize(&self, w: u32, h: u32) -> bool {
+        self.0.resize.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|resize| resize((w, h)))
     }
 
     /// What the host said about the track the plugin is on, if anything.
@@ -65,9 +75,21 @@ impl GuiContext {
         *self.0.wake.write().unwrap_or_else(|e| e.into_inner()) = Some(wake);
     }
 
-    /// After this returns no `wake` runs any more, though clones of this context may live on.
+    /// After this returns no `wake` or `resize` runs any more, though clones of this context may live on.
     pub(crate) fn disconnect(&self) {
         *self.0.wake.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.disconnect_resize();
+    }
+
+    /// What `request_resize` does while an editor is open; it may be called from any thread but the
+    /// audio thread.
+    pub(crate) fn connect_resize(&self, resize: Resizer) {
+        *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = Some(resize);
+    }
+
+    /// After this returns no `resize` runs any more.
+    pub(crate) fn disconnect_resize(&self) {
+        *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Hands the queued events to `deliver` in order until it refuses one, which stays first in the
@@ -82,6 +104,8 @@ impl GuiContext {
 }
 
 type Waker = Box<dyn Fn(Wake) + Send + Sync>;
+/// Takes a size at a scale of 1.0; true when the host was asked and has not refused.
+pub(crate) type Resizer = Box<dyn Fn((u32, u32)) -> bool + Send + Sync>;
 
 struct Channel {
     /// Weak, since the shared half may keep this context.
@@ -89,6 +113,7 @@ struct Channel {
     queue: Queue,
     dirty: AtomicBool,
     wake: RwLock<Option<Waker>>,
+    resize: RwLock<Option<Resizer>>,
     track: Mutex<Option<TrackInfo>>,
 }
 
@@ -222,9 +247,17 @@ impl Queue {
     }
 
     fn drain(&self, mut deliver: impl FnMut(Event) -> bool) {
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
         if self.draining.swap(true, Ordering::Acquire) {
             return;
         }
+        // Also when `deliver` panics, or no drain would ever run again.
+        let _done = Done(&self.draining);
         loop {
             let head = self.head.load(Ordering::Relaxed);
             if head == self.tail.load(Ordering::Acquire) {
@@ -250,7 +283,6 @@ impl Queue {
             }
             self.head.store(head + 1, Ordering::Release);
         }
-        self.draining.store(false, Ordering::Release);
     }
 }
 
@@ -330,5 +362,15 @@ mod tests {
             true
         });
         assert_eq!(outer, [Event::Begin(1), Event::End(1)]);
+    }
+
+    #[test]
+    fn a_panic_while_delivering_leaves_the_queue_working() {
+        let queue = Queue::default();
+        queue.push(Event::Begin(1));
+        queue.push(Event::End(1));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| queue.drain(|_| panic!("the host failed"))));
+        assert!(panicked.is_err());
+        assert_eq!(drained(&queue), [Event::Begin(1), Event::End(1)], "the event being delivered stays first");
     }
 }

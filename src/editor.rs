@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui_baseview::baseview;
@@ -9,31 +9,64 @@ use egui_baseview::baseview::dpi::NativeSize;
 use egui_baseview::{App, EguiWindow, EguiWindowSettings, Frame, RepaintNotifier};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 
-/// The editor's scale factor, as the host gives it; 1.0 until it does. The scale the system reports
-/// to the window is never used, since the host would not know the size that gives the window.
-///
-/// When the host changes it while the window is open, the window follows on its next frame by
-/// resizing itself, and the format asks the host to resize the parent to match: that keeps the open
-/// window instead of reopening it in a parent the host may not have resized yet.
-#[derive(Clone)]
-pub struct Scale(Arc<ScaleInner>);
+use crate::{Plugin, Shared};
 
-struct ScaleInner {
+/// The editor's size and the host's scale factor, shared by the format's view and the window.
+///
+/// The size is at a scale of 1.0 and changes only for a resizable editor, never to below its
+/// minimum. The scale is the host's, 1.0 until it gives one. The scale the system reports to the
+/// window is never used, since the host would not know the size that gives the window.
+///
+/// When either changes while the window is open, the window follows on its next frame by resizing
+/// itself, and the parent is resized to match by the host or at the format's request: that keeps the
+/// open window instead of reopening it in a parent the host may not have resized yet.
+#[derive(Clone)]
+pub struct Geometry(Arc<GeometryInner>);
+
+struct GeometryInner {
     factor: AtomicU64,
+    /// `width << 32 | height`.
+    size: AtomicU64,
+    /// `None` for an editor of fixed size.
+    min: Option<(u32, u32)>,
+    shared: Weak<dyn Shared>,
     repaint: RepaintNotifier,
 }
 
-impl Default for Scale {
-    fn default() -> Self {
-        Scale(Arc::new(ScaleInner { factor: AtomicU64::new(1f64.to_bits()), repaint: RepaintNotifier::new() }))
-    }
+fn pack((width, height): (u32, u32)) -> u64 {
+    (width as u64) << 32 | height as u64
 }
 
-impl Scale {
+fn unpack(size: u64) -> (u32, u32) {
+    ((size >> 32) as u32, size as u32)
+}
+
+impl Geometry {
     const RANGE: std::ops::RangeInclusive<f64> = 0.25..=8.0;
 
+    /// At the size the plugin keeps for a resizable editor, or else `P::EDITOR_SIZE`.
+    pub fn new<P: Plugin>(shared: &Arc<P::Shared>) -> Self {
+        let shared: Arc<dyn Shared> = shared.clone();
+        Self::with(P::EDITOR_SIZE, P::RESIZABLE.then_some(P::EDITOR_MIN), &shared)
+    }
+
+    /// `min` is `None` for an editor of fixed size.
+    fn with(size: (u32, u32), min: Option<(u32, u32)>, shared: &Arc<dyn Shared>) -> Self {
+        let geometry = Geometry(Arc::new(GeometryInner {
+            factor: AtomicU64::new(1f64.to_bits()),
+            size: AtomicU64::new(pack(size)),
+            min,
+            shared: Arc::downgrade(shared),
+            repaint: RepaintNotifier::new(),
+        }));
+        if let Some(size) = min.and(shared.editor_size()) {
+            geometry.0.size.store(pack(geometry.fit(size)), Ordering::Relaxed);
+        }
+        geometry
+    }
+
     /// False, leaving the factor as it was, for one no window could be drawn at.
-    pub fn set(&self, factor: f64) -> bool {
+    pub fn set_scale(&self, factor: f64) -> bool {
         if !Self::RANGE.contains(&factor) {
             return false;
         }
@@ -42,14 +75,67 @@ impl Scale {
         true
     }
 
-    pub fn get(&self) -> f64 {
+    pub fn scale(&self) -> f64 {
         f64::from_bits(self.0.factor.load(Ordering::Relaxed))
     }
 
     /// `size` at this scale, in the platform's pixels.
     pub fn of(&self, size: (u32, u32)) -> (u32, u32) {
-        let factor = self.get();
+        let factor = self.scale();
         ((size.0 as f64 * factor).round() as u32, (size.1 as f64 * factor).round() as u32)
+    }
+
+    /// At a scale of 1.0.
+    pub fn size(&self) -> (u32, u32) {
+        unpack(self.0.size.load(Ordering::Relaxed))
+    }
+
+    /// The size at this scale, in the platform's pixels.
+    pub fn physical(&self) -> (u32, u32) {
+        self.of(self.size())
+    }
+
+    pub fn resizable(&self) -> bool {
+        self.0.min.is_some()
+    }
+
+    /// The size nearest `size` the editor can take, both at a scale of 1.0.
+    pub fn fit(&self, size: (u32, u32)) -> (u32, u32) {
+        match self.0.min {
+            Some(min) => (size.0.max(min.0), size.1.max(min.1)),
+            None => self.size(),
+        }
+    }
+
+    /// Like `fit`, in the platform's pixels at this scale.
+    pub fn fit_physical(&self, size: (u32, u32)) -> (u32, u32) {
+        match self.0.min {
+            Some(min) => {
+                let min = self.of(min);
+                (size.0.max(min.0), size.1.max(min.1))
+            }
+            None => self.physical(),
+        }
+    }
+
+    /// Takes the size nearest `size`, at a scale of 1.0, and tells the plugin when that changed it.
+    pub fn resize(&self, size: (u32, u32)) {
+        if !self.resizable() {
+            return;
+        }
+        let size = self.fit(size);
+        if self.0.size.swap(pack(size), Ordering::Relaxed) != pack(size) {
+            self.0.repaint.request_repaint();
+            if let Some(shared) = self.0.shared.upgrade() {
+                shared.set_editor_size(size.0, size.1);
+            }
+        }
+    }
+
+    /// Like `resize`, for a size in the platform's pixels at this scale.
+    pub fn resize_physical(&self, size: (u32, u32)) {
+        let factor = self.scale();
+        self.resize(((size.0 as f64 / factor).round() as u32, (size.1 as f64 / factor).round() as u32));
     }
 }
 
@@ -90,24 +176,25 @@ impl Drop for Window {
     }
 }
 
-/// `size` is the editor's size at a scale of 1.0, in the platform's pixels, as CLAP and VST3 hosts
-/// measure the parent on Linux and Windows. `on_frame` runs before `ui` on the window's thread.
-/// `None` when the parent is no window of this platform or the window cannot be opened, e.g.
-/// without a display.
-pub fn open(parent: Parent, size: (u32, u32), scale: Scale, ui: Box<dyn FnMut(&mut egui::Ui) + Send>, on_frame: Box<dyn FnMut() + Send>) -> Option<Window> {
+/// Opens at `geometry`'s size, in the platform's pixels as CLAP and VST3 hosts measure the parent on
+/// Linux and Windows. `on_frame` runs before `ui` on the window's thread. `None` when the parent is
+/// no window of this platform or the window cannot be opened, e.g. without a display.
+pub fn open(parent: Parent, geometry: Geometry, ui: Box<dyn FnMut(&mut egui::Ui) + Send>, on_frame: Box<dyn FnMut() + Send>) -> Option<Window> {
     let parent = Handle(raw(parent)?);
-    let (width, height) = scale.of(size);
+    let (width, height) = geometry.physical();
+    // Resizable to baseview, which otherwise ignores the sizes the window asks for when the host's
+    // scale or the editor's size changes.
     let settings = EguiWindowSettings::new()
         .with_size(NativeSize::new(width, height))
-        .with_resizable(false)
-        .with_repaint_notifier(scale.0.repaint.clone())
+        .with_resizable(true)
+        .with_repaint_notifier(geometry.0.repaint.clone())
         .with_parent(&parent);
     #[cfg(target_os = "linux")]
     let finished = std::sync::Arc::new(x11::Finished::default());
     let editor = Editor {
         ui,
         on_frame,
-        fit: Fit { size, scale, applied: settings.zoom_factor },
+        fit: Fit::new(geometry, settings.zoom_factor),
         #[cfg(target_os = "linux")]
         finished: finished.clone(),
     };
@@ -170,19 +257,25 @@ impl App for Editor {
     }
 }
 
-/// Keeps the window at `size` times the host's scale, drawn at that scale, whatever scale the system
-/// reports to the window: egui's zoom makes up the difference.
+/// Keeps the window at the editor's size times the host's scale, drawn at that scale, whatever scale
+/// the system reports to the window: egui's zoom makes up the difference.
 struct Fit {
-    size: (u32, u32),
-    scale: Scale,
+    geometry: Geometry,
     /// The zoom egui-baseview last saw. It answers a change of zoom by resizing the window by the
     /// same ratio, unless the pass also asks for a size.
     applied: f32,
+    /// The size the window was last asked for, at a scale of 1.0.
+    size: (u32, u32),
 }
 
 impl Fit {
+    fn new(geometry: Geometry, zoom: f32) -> Self {
+        let size = geometry.size();
+        Fit { geometry, applied: zoom, size }
+    }
+
     fn zoom(&self, system: f32) -> f32 {
-        self.scale.get() as f32 / system
+        self.geometry.scale() as f32 / system
     }
 
     /// A zoom set here takes effect from the next pass.
@@ -191,29 +284,119 @@ impl Fit {
         if ctx.zoom_factor() != zoom {
             ctx.set_zoom_factor(zoom);
         }
-        if ctx.zoom_factor() != self.applied {
+        let size = self.geometry.size();
+        if ctx.zoom_factor() != self.applied || size != self.size {
             self.applied = ctx.zoom_factor();
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(self.size.0 as f32, self.size.1 as f32)));
+            self.size = size;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.0 as f32, size.1 as f32)));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use egui::{RawInput, ViewportCommand, ViewportId, vec2};
 
     use super::*;
+    use crate::{GuiContext, ParamInfo};
+
+    /// Keeps the editor's size as a plugin would, starting from `kept`.
+    struct Kept {
+        kept: Option<(u32, u32)>,
+        told: Mutex<Vec<(u32, u32)>>,
+    }
+
+    impl Shared for Kept {
+        fn params(&self) -> &'static [ParamInfo] {
+            &[]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {}
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self, _: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+            Box::new(|_| {})
+        }
+        fn editor_size(&self) -> Option<(u32, u32)> {
+            self.kept
+        }
+        fn set_editor_size(&self, width: u32, height: u32) {
+            self.told.lock().unwrap().push((width, height));
+        }
+    }
+
+    fn kept(kept: Option<(u32, u32)>) -> Arc<Kept> {
+        Arc::new(Kept { kept, told: Mutex::default() })
+    }
+
+    fn fixed(size: (u32, u32)) -> Geometry {
+        let shared: Arc<dyn Shared> = kept(None);
+        Geometry::with(size, None, &shared)
+    }
 
     #[test]
     fn a_scale_no_window_could_be_drawn_at_is_refused() {
-        let scale = Scale::default();
-        assert_eq!(scale.of((380, 220)), (380, 220));
-        assert!(scale.set(1.25));
-        assert_eq!(scale.of((380, 220)), (475, 275));
+        let geometry = fixed((380, 220));
+        assert_eq!(geometry.physical(), (380, 220));
+        assert!(geometry.set_scale(1.25));
+        assert_eq!(geometry.physical(), (475, 275));
         for factor in [0.0, -1.0, f64::NAN, f64::INFINITY, 100.0] {
-            assert!(!scale.set(factor), "{factor}");
+            assert!(!geometry.set_scale(factor), "{factor}");
         }
-        assert_eq!(scale.get(), 1.25);
+        assert_eq!(geometry.scale(), 1.25);
+    }
+
+    #[test]
+    fn a_fixed_editor_keeps_its_size_whatever_the_plugin_kept_or_the_host_asks() {
+        let shared = kept(Some((900, 600)));
+        let dynamic: Arc<dyn Shared> = shared.clone();
+        let geometry = Geometry::with((380, 220), None, &dynamic);
+        assert_eq!(geometry.size(), (380, 220));
+        assert!(!geometry.resizable());
+        assert!(geometry.set_scale(2.0));
+        assert_eq!(geometry.fit((10, 10)), (380, 220));
+        assert_eq!(geometry.fit_physical((10, 10)), (760, 440));
+        geometry.resize((500, 500));
+        geometry.resize_physical((1000, 1000));
+        assert_eq!(geometry.size(), (380, 220));
+        assert!(shared.told.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resizable_editor_opens_at_the_size_the_plugin_kept_and_never_below_its_minimum() {
+        let shared = kept(Some((1000, 300)));
+        let dynamic: Arc<dyn Shared> = shared.clone();
+        let geometry = Geometry::with((1180, 680), Some((760, 440)), &dynamic);
+        assert_eq!(geometry.size(), (1000, 440), "the kept size, made no smaller than the minimum");
+        assert!(shared.told.lock().unwrap().is_empty(), "opening is no resize");
+
+        geometry.resize((800, 500));
+        assert_eq!(geometry.size(), (800, 500));
+        geometry.resize((800, 500));
+        geometry.resize((10, 10));
+        assert_eq!(geometry.size(), (760, 440));
+        assert!(geometry.set_scale(1.5));
+        assert_eq!(geometry.fit_physical((10, 2000)), (1140, 2000));
+        geometry.resize_physical((1500, 900));
+        assert_eq!((geometry.size(), geometry.physical()), ((1000, 600), (1500, 900)));
+        assert_eq!(*shared.told.lock().unwrap(), [(800, 500), (760, 440), (1000, 600)], "once for each change");
+
+        let fresh: Arc<dyn Shared> = kept(None);
+        assert_eq!(Geometry::with((1180, 680), Some((760, 440)), &fresh).size(), (1180, 680));
     }
 
     /// One pass as egui-baseview runs it, with the scale the system reports; the sizes it was asked for.
@@ -235,8 +418,8 @@ mod tests {
     #[test]
     fn the_window_draws_at_the_hosts_scale_whatever_scale_the_system_reports() {
         let ctx = egui::Context::default();
-        let mut fit = Fit { size: (380, 220), scale: Scale::default(), applied: 1.0 };
-        assert!(fit.scale.set(1.5));
+        let mut fit = Fit::new(fixed((380, 220)), 1.0);
+        assert!(fit.geometry.set_scale(1.5));
 
         assert_eq!(pass(&ctx, &mut fit, 2.0), vec![], "the zoom applies from the next pass");
         assert_eq!(pass(&ctx, &mut fit, 2.0), vec![vec2(380.0, 220.0)]);
@@ -244,7 +427,7 @@ mod tests {
         assert_eq!(physical(vec2(380.0, 220.0), ctx.zoom_factor(), 2.0), (570, 330));
         assert_eq!(pass(&ctx, &mut fit, 2.0), vec![]);
 
-        assert!(fit.scale.set(1.0));
+        assert!(fit.geometry.set_scale(1.0));
         pass(&ctx, &mut fit, 2.0);
         assert_eq!(pass(&ctx, &mut fit, 2.0), vec![vec2(380.0, 220.0)]);
         assert_eq!(ctx.pixels_per_point(), 1.0);
@@ -253,6 +436,22 @@ mod tests {
         assert_eq!(pass(&ctx, &mut fit, 1.25), vec![vec2(380.0, 220.0)], "the system's scale changed under the window");
         assert_eq!(ctx.pixels_per_point(), 1.0);
         assert_eq!(physical(vec2(380.0, 220.0), ctx.zoom_factor(), 1.25), (380, 220));
+    }
+
+    #[test]
+    fn the_window_follows_a_resize_at_the_hosts_scale() {
+        let ctx = egui::Context::default();
+        let shared: Arc<dyn Shared> = kept(None);
+        let mut fit = Fit::new(Geometry::with((1180, 680), Some((760, 440)), &shared), 1.0);
+        assert!(fit.geometry.set_scale(2.0));
+        pass(&ctx, &mut fit, 1.0);
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![vec2(1180.0, 680.0)]);
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![]);
+
+        fit.geometry.resize((900, 500));
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![vec2(900.0, 500.0)]);
+        assert_eq!(physical(vec2(900.0, 500.0), ctx.zoom_factor(), 1.0), (1800, 1000));
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![]);
     }
 }
 

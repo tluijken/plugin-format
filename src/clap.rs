@@ -149,6 +149,7 @@ impl<P: Plugin> Instance<P> {
         let latency = plugin.latency();
         let weak: Weak<dyn Shared> = Arc::downgrade(&shared) as Weak<P::Shared>;
         let cx = GuiContext::new(weak);
+        let gui = Mutex::new(Gui::new::<P>(&shared));
         let instance = Box::into_raw(Box::new(Instance {
             clap: clap_plugin {
                 desc,
@@ -175,7 +176,7 @@ impl<P: Plugin> Instance<P> {
             host_state: AtomicPtr::new(ptr::null_mut()),
             host_track_info: AtomicPtr::new(ptr::null_mut()),
             cx,
-            gui: Mutex::default(),
+            gui,
         }));
         unsafe {
             (*instance).clap.plugin_data = instance as *mut c_void;
@@ -702,7 +703,7 @@ impl<P: Plugin> Instance<P> {
         get_size: Some(Self::gui_size),
         can_resize: Some(Self::gui_can_resize),
         get_resize_hints: Some(Self::gui_resize_hints),
-        adjust_size: Some(Self::gui_size),
+        adjust_size: Some(Self::gui_adjust_size),
         set_size: Some(Self::gui_set_size),
         set_parent: Some(Self::gui_set_parent),
         set_transient: Some(Self::gui_set_transient),
@@ -735,40 +736,56 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn gui_create(plugin: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
-        Self::with_gui(plugin, || false, |gui| {
+        Self::with(plugin, || false, |instance| {
+            let Ok(mut gui) = instance.gui.try_lock() else { return false };
             if !supported(api, floating) {
                 return false;
             }
-            gui.window = None;
-            gui.created = true;
+            instance.close(&mut gui);
+            *gui = Gui { created: true, ..Gui::new::<P>(&instance.shared) };
             true
         })
     }
 
     unsafe extern "C" fn gui_destroy(plugin: *const clap_plugin) {
-        Self::with_gui(plugin, || (), |gui| *gui = Gui::default())
+        Self::with(plugin, || (), |instance| {
+            let Ok(mut gui) = instance.gui.try_lock() else { return };
+            instance.close(&mut gui);
+            *gui = Gui::new::<P>(&instance.shared);
+        })
+    }
+
+    /// Drops the window first: on Linux that waits for the window's thread, which may be asking the
+    /// host for a size.
+    fn close(&self, gui: &mut Gui) {
+        gui.window = None;
+        self.cx.disconnect_resize();
     }
 
     /// X11 and Win32 sizes are physical pixels, so the scale applies to both.
     unsafe extern "C" fn gui_set_scale(plugin: *const clap_plugin, scale: f64) -> bool {
         Self::with(plugin, || false, |instance| {
             let Ok(gui) = instance.gui.try_lock() else { return false };
-            let before = gui.scale.of(P::EDITOR_SIZE);
-            if !gui.scale.set(scale) {
+            let before = gui.geometry.physical();
+            if !gui.geometry.set_scale(scale) {
                 return false;
             }
-            let (width, height) = gui.scale.of(P::EDITOR_SIZE);
+            let (width, height) = gui.geometry.physical();
             let open = gui.window.is_some();
             // The host may answer the request with `set_size` before it returns.
             drop(gui);
-            if open && (width, height) != before {
-                let host_gui = unsafe { instance.host_extension(CLAP_EXT_GUI) } as *const clap_host_gui;
-                if let Some(request_resize) = unsafe { host_gui.as_ref() }.and_then(|g| g.request_resize) {
-                    unsafe { request_resize(instance.host, width, height) };
-                }
+            if open && (width, height) != before
+                && let Some(request_resize) = instance.host_request_resize()
+            {
+                unsafe { request_resize(instance.host, width, height) };
             }
             true
         })
+    }
+
+    fn host_request_resize(&self) -> Option<unsafe extern "C" fn(*const clap_host, u32, u32) -> bool> {
+        let host_gui = unsafe { self.host_extension(CLAP_EXT_GUI) } as *const clap_host_gui;
+        unsafe { host_gui.as_ref() }.and_then(|g| g.request_resize)
     }
 
     unsafe extern "C" fn gui_size(plugin: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
@@ -776,7 +793,7 @@ impl<P: Plugin> Instance<P> {
             if width.is_null() || height.is_null() {
                 return false;
             }
-            let size = gui.scale.of(P::EDITOR_SIZE);
+            let size = gui.geometry.physical();
             unsafe {
                 width.write(size.0);
                 height.write(size.1);
@@ -786,15 +803,49 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn gui_can_resize(_: *const clap_plugin) -> bool {
-        false
+        P::RESIZABLE
     }
 
-    unsafe extern "C" fn gui_resize_hints(_: *const clap_plugin, _: *mut clap_gui_resize_hints) -> bool {
-        false
+    unsafe extern "C" fn gui_resize_hints(_: *const clap_plugin, hints: *mut clap_gui_resize_hints) -> bool {
+        guard(false, || {
+            if !P::RESIZABLE || hints.is_null() {
+                return false;
+            }
+            let free = clap_gui_resize_hints {
+                can_resize_horizontally: true,
+                can_resize_vertically: true,
+                preserve_aspect_ratio: false,
+                aspect_ratio_width: 0,
+                aspect_ratio_height: 0,
+            };
+            unsafe { hints.write(free) };
+            true
+        })
     }
 
+    unsafe extern "C" fn gui_adjust_size(plugin: *const clap_plugin, width: *mut u32, height: *mut u32) -> bool {
+        Self::with_gui(plugin, || false, |gui| {
+            if width.is_null() || height.is_null() {
+                return false;
+            }
+            let size = gui.geometry.fit_physical(unsafe { (width.read(), height.read()) });
+            unsafe {
+                width.write(size.0);
+                height.write(size.1);
+            }
+            true
+        })
+    }
+
+    /// Only a size `adjust_size` would leave as it is.
     unsafe extern "C" fn gui_set_size(plugin: *const clap_plugin, width: u32, height: u32) -> bool {
-        Self::with_gui(plugin, || false, |gui| (width, height) == gui.scale.of(P::EDITOR_SIZE))
+        Self::with_gui(plugin, || false, |gui| {
+            if gui.geometry.fit_physical((width, height)) != (width, height) {
+                return false;
+            }
+            gui.geometry.resize_physical((width, height));
+            true
+        })
     }
 
     unsafe extern "C" fn gui_set_parent(plugin: *const clap_plugin, window: *const clap_window) -> bool {
@@ -808,10 +859,30 @@ impl<P: Plugin> Instance<P> {
             let parent = Parent::Win32(unsafe { window.specific.win32 });
             #[cfg(not(target_os = "windows"))]
             let parent = Parent::X11(unsafe { window.specific.x11 });
-            gui.window = None;
-            gui.window = editor::open(parent, P::EDITOR_SIZE, gui.scale.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
+            instance.close(&mut gui);
+            gui.window = editor::open(parent, gui.geometry.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
+            if gui.window.is_some() && P::RESIZABLE {
+                instance.connect_resize(gui.geometry.clone());
+            }
             gui.window.is_some()
         })
+    }
+
+    /// The host's `request_resize` is thread-safe, so the editor asks it from its own thread.
+    fn connect_resize(&self, geometry: editor::Geometry) {
+        let Some(request_resize) = self.host_request_resize() else { return };
+        // `destroy` disconnects before the host may go away.
+        let host = self.host as usize;
+        self.cx.connect_resize(Box::new(move |size| {
+            let size = geometry.fit(size);
+            let (width, height) = geometry.of(size);
+            // The host may answer with `set_size` before it returns, but need not.
+            if !unsafe { request_resize(host as *const clap_host, width, height) } {
+                return false;
+            }
+            geometry.resize(size);
+            true
+        }));
     }
 
     /// Embedded only, so there is no floating window to keep above the host's.
@@ -849,11 +920,16 @@ fn supported(api: *const c_char, floating: bool) -> bool {
 }
 
 /// Only the main thread uses it, as CLAP requires of every gui call.
-#[derive(Default)]
 struct Gui {
     created: bool,
     window: Option<editor::Window>,
-    scale: editor::Scale,
+    geometry: editor::Geometry,
+}
+
+impl Gui {
+    fn new<P: Plugin>(shared: &Arc<P::Shared>) -> Self {
+        Gui { created: false, window: None, geometry: editor::Geometry::new::<P>(shared) }
+    }
 }
 
 #[cfg(test)]
@@ -1072,6 +1148,173 @@ mod tests {
 
             assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 16));
             assert_eq!((CHANGES.load(Ordering::SeqCst), SEEN.load(Ordering::SeqCst)), (2, 9));
+            (p.destroy.unwrap())(plugin);
+        }
+    }
+
+    /// Keeps the editor's size, as a plugin would in its state.
+    struct Remembers(Mutex<Option<(u32, u32)>>);
+
+    impl Shared for Remembers {
+        fn params(&self) -> &'static [ParamInfo] {
+            &[]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {}
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self, _: crate::GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+            Box::new(|_| {})
+        }
+        fn editor_size(&self) -> Option<(u32, u32)> {
+            *self.0.lock().unwrap()
+        }
+        fn set_editor_size(&self, width: u32, height: u32) {
+            *self.0.lock().unwrap() = Some((width, height));
+        }
+    }
+
+    struct Wide;
+
+    impl Plugin for Wide {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1180, 680);
+        const RESIZABLE: bool = true;
+        const EDITOR_MIN: (u32, u32) = (760, 440);
+        type Shared = Remembers;
+        fn new() -> (Self, Arc<Remembers>) {
+            (Wide, Arc::new(Remembers(Mutex::new(Some((1000, 500))))))
+        }
+        fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
+            0
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, _: Block<'_>) {}
+        fn take_latency_changed(&mut self) -> bool {
+            false
+        }
+    }
+
+    static ASKED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    static REFUSE: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn request_resize(_: *const clap_host, width: u32, height: u32) -> bool {
+        ASKED.lock().unwrap().push((width, height));
+        !REFUSE.load(Ordering::SeqCst)
+    }
+
+    static HOST_GUI: clap_host_gui = clap_host_gui { resize_hints_changed: None, request_resize: Some(request_resize), request_show: None, request_hide: None, closed: None };
+
+    unsafe extern "C" fn host_gui(_: *const clap_host, id: *const c_char) -> *const c_void {
+        if same(id, CLAP_EXT_GUI) { &HOST_GUI as *const _ as *const c_void } else { ptr::null() }
+    }
+
+    fn sized_host() -> clap_host {
+        clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: ptr::null_mut(),
+            name: c"".as_ptr(),
+            vendor: c"".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"".as_ptr(),
+            get_extension: Some(host_gui),
+            request_restart: None,
+            request_process: None,
+            request_callback: None,
+        }
+    }
+
+    unsafe fn gui_size_of(gui: &clap_plugin_gui, plugin: *const clap_plugin) -> (u32, u32) {
+        let (mut width, mut height) = (0, 0);
+        assert!(unsafe { (gui.get_size.unwrap())(plugin, &mut width, &mut height) });
+        (width, height)
+    }
+
+    #[test]
+    fn adjust_size_respects_the_minimum() {
+        let host = sized_host();
+        unsafe {
+            let factory = &Factory::<Wide>::FACTORY;
+            let plugin = (factory.create_plugin.unwrap())(factory, &host, descriptor::<Wide>().id);
+            let p = &*plugin;
+            assert!((p.init.unwrap())(plugin));
+            let gui = &*((p.get_extension.unwrap())(plugin, CLAP_EXT_GUI.as_ptr()) as *const clap_plugin_gui);
+            assert!((gui.create.unwrap())(plugin, NATIVE_API.unwrap().as_ptr(), false));
+            assert!((gui.can_resize.unwrap())(plugin));
+            let mut hints: clap_gui_resize_hints = std::mem::zeroed();
+            assert!((gui.get_resize_hints.unwrap())(plugin, &mut hints));
+            assert!(hints.can_resize_horizontally && hints.can_resize_vertically && !hints.preserve_aspect_ratio);
+            assert_eq!(gui_size_of(gui, plugin), (1000, 500), "the size the plugin kept");
+
+            let (mut width, mut height) = (10, 10);
+            assert!((gui.adjust_size.unwrap())(plugin, &mut width, &mut height));
+            assert_eq!((width, height), Wide::EDITOR_MIN);
+            let (mut width, mut height) = (2000, 300);
+            assert!((gui.adjust_size.unwrap())(plugin, &mut width, &mut height));
+            assert_eq!((width, height), (2000, 440));
+
+            assert!((gui.set_scale.unwrap())(plugin, 2.0));
+            let (mut width, mut height) = (10, 10);
+            assert!((gui.adjust_size.unwrap())(plugin, &mut width, &mut height));
+            assert_eq!((width, height), (1520, 880), "at the host's scale");
+            assert!(!(gui.set_size.unwrap())(plugin, 1520, 879));
+            assert!((gui.set_size.unwrap())(plugin, 2000, 1200));
+            assert_eq!(gui_size_of(gui, plugin), (2000, 1200));
+            let instance = Instance::<Wide>::from(plugin).unwrap();
+            assert_eq!(instance.shared.editor_size(), Some((1000, 600)), "kept at a scale of 1.0");
+
+            (gui.destroy.unwrap())(plugin);
+            assert!((gui.create.unwrap())(plugin, NATIVE_API.unwrap().as_ptr(), false));
+            assert_eq!(gui_size_of(gui, plugin), (1000, 600), "a new gui opens at the size it was left at");
+            (gui.destroy.unwrap())(plugin);
+            (p.destroy.unwrap())(plugin);
+        }
+    }
+
+    #[test]
+    fn the_editor_asks_the_host_for_a_size_no_smaller_than_its_minimum() {
+        let host = sized_host();
+        unsafe {
+            let factory = &Factory::<Wide>::FACTORY;
+            let plugin = (factory.create_plugin.unwrap())(factory, &host, descriptor::<Wide>().id);
+            let p = &*plugin;
+            assert!((p.init.unwrap())(plugin));
+            let gui = &*((p.get_extension.unwrap())(plugin, CLAP_EXT_GUI.as_ptr()) as *const clap_plugin_gui);
+            assert!((gui.create.unwrap())(plugin, NATIVE_API.unwrap().as_ptr(), false));
+            assert!((gui.set_scale.unwrap())(plugin, 1.5));
+            let instance = Instance::<Wide>::from(plugin).unwrap();
+            let cx = instance.cx.clone();
+            assert!(!cx.request_resize(900, 900), "nothing to resize without a window");
+
+            // What `set_parent` does once the window is open, which needs a display.
+            instance.connect_resize(instance.gui.lock().unwrap().geometry.clone());
+            assert!(cx.request_resize(100, 2000));
+            assert_eq!(*ASKED.lock().unwrap(), [(1140, 3000)]);
+            assert_eq!(gui_size_of(gui, plugin), (1140, 3000));
+            assert_eq!(instance.shared.editor_size(), Some((760, 2000)));
+
+            REFUSE.store(true, Ordering::SeqCst);
+            assert!(!cx.request_resize(900, 900));
+            assert_eq!(gui_size_of(gui, plugin), (1140, 3000), "a refused size is not taken");
+
+            (gui.destroy.unwrap())(plugin);
+            assert!(!cx.request_resize(900, 900), "nothing to resize once the gui is gone");
+            assert_eq!(ASKED.lock().unwrap().len(), 2);
             (p.destroy.unwrap())(plugin);
         }
     }

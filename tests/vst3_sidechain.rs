@@ -2,7 +2,6 @@
 
 #![allow(non_snake_case)]
 
-use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -41,7 +40,7 @@ fn library() -> &'static libloading::Library {
             }
             #[cfg(not(windows))]
             {
-                let entry: libloading::Symbol<extern "system" fn(*mut c_void) -> bool> = library.get(b"ModuleEntry\0").unwrap();
+                let entry: libloading::Symbol<extern "system" fn(*mut std::ffi::c_void) -> bool> = library.get(b"ModuleEntry\0").unwrap();
                 assert!(entry(ptr::null_mut()));
             }
             library
@@ -139,7 +138,7 @@ impl Instance {
 
 fn context(position: i64, playing: bool) -> ProcessContext {
     let mut context: ProcessContext = unsafe { std::mem::zeroed() };
-    context.state = if playing { kPlaying as u32 } else { 0 };
+    context.state = if playing { kPlaying as uint32 } else { 0 };
     context.sampleRate = 48_000.0;
     context.projectTimeSamples = position;
     context
@@ -154,9 +153,9 @@ fn the_sidechain_is_a_second_aux_bus_that_starts_inactive() {
         assert_eq!((plugin.component.getBusCount(audio, input), plugin.component.getBusCount(audio, output)), (2, 1));
         let mut bus: BusInfo = std::mem::zeroed();
         assert_eq!(plugin.component.getBusInfo(audio, input, 1, &mut bus), kResultOk);
-        assert_eq!((bus.channelCount, bus.busType, bus.flags & kDefaultActive as u32), (2, BusTypes_::kAux as i32, 0));
+        assert_eq!((bus.channelCount, bus.busType, bus.flags & kDefaultActive as uint32), (2, BusTypes_::kAux as i32, 0));
         assert_eq!(plugin.component.getBusInfo(audio, input, 0, &mut bus), kResultOk);
-        assert_eq!((bus.busType, bus.flags & kDefaultActive as u32 != 0), (BusTypes_::kMain as i32, true));
+        assert_eq!((bus.busType, bus.flags & kDefaultActive as uint32 != 0), (BusTypes_::kMain as i32, true));
         assert_eq!(plugin.component.getBusInfo(audio, output, 1, &mut bus), kInvalidArgument);
         assert_eq!(plugin.component.getBusInfo(audio, input, 2, &mut bus), kInvalidArgument);
         let mut arrangement = 0;

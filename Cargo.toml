@@ -30,3 +30,10 @@ clap-sys = "0.5"
 libloading = "0.8"
 serde_json = "1"
 vst3 = "0.3"
+
+# A parent window for the editor test, and the process's threads on Windows.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = "0.13"
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

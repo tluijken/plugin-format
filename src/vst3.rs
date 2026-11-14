@@ -685,11 +685,11 @@ impl<P: Plugin> ChannelContext::IInfoListenerTrait for Component<P> {
             let Some(list) = (unsafe { ComRef::from_raw(list) }) else { return kInvalidArgument };
             let mut buffer = [0 as TChar; 256];
             let name = (unsafe { list.getString(ChannelContext::kChannelNameKey, buffer.as_mut_ptr(), size_of_val(&buffer) as u32) } == kResultOk).then(|| {
-                let units: Vec<u16> = buffer.iter().map(|&c| c as u16).take_while(|&c| c != 0).collect();
+                let units: Vec<u16> = buffer.iter().copied().take_while(|&c| c != 0).collect();
                 String::from_utf16_lossy(&units)
             });
             let mut argb = 0i64;
-            let color = (unsafe { list.getInt(ChannelContext::kChannelColorKey, &mut argb) } == kResultOk).then(|| [(argb >> 16) as u8, (argb >> 8) as u8, argb as u8]);
+            let color = (unsafe { list.getInt(ChannelContext::kChannelColorKey, &mut argb) } == kResultOk).then_some([(argb >> 16) as u8, (argb >> 8) as u8, argb as u8]);
             self.host.cx.set_track(TrackInfo { name, color });
             kResultOk
         })
@@ -801,7 +801,7 @@ impl<P: Plugin> IEditControllerTrait for Component<P> {
             }
             let view = ComWrapper::new(View::<P>::new(self));
             let Some(plug_view) = view.to_com_ptr::<IPlugView>() else { return ptr::null_mut() };
-            view.this.store(plug_view.as_ptr(), Ordering::Release);
+            view.sizing.this.store(plug_view.as_ptr(), Ordering::Release);
             plug_view.into_raw()
         })
     }
@@ -827,10 +827,7 @@ struct View<P: Plugin> {
     #[cfg(target_os = "linux")]
     timer: Mutex<Option<Timer>>,
     window: Mutex<Option<editor::Window>>,
-    frame: Mutex<Option<ComPtr<IPlugFrame>>>,
-    scale: editor::Scale,
-    /// This view as the host holds it, for `resizeView`; not a reference, so it does not keep itself alive.
-    this: AtomicPtr<IPlugView>,
+    sizing: Arc<Sizing>,
 }
 
 impl<P: Plugin> Class for View<P> {
@@ -845,9 +842,12 @@ impl<P: Plugin> View<P> {
             #[cfg(target_os = "linux")]
             timer: Mutex::new(None),
             window: Mutex::new(None),
-            frame: Mutex::new(None),
-            scale: editor::Scale::default(),
-            this: AtomicPtr::new(ptr::null_mut()),
+            sizing: Arc::new(Sizing {
+                geometry: editor::Geometry::new::<P>(&component.shared),
+                frame: Mutex::new(None),
+                this: AtomicPtr::new(ptr::null_mut()),
+                requested: Mutex::new(None),
+            }),
         }
     }
 
@@ -859,45 +859,105 @@ impl<P: Plugin> View<P> {
         *window = None;
         #[cfg(target_os = "windows")]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = {
-            let host = self.host.clone();
-            (Parent::Win32(parent), Box::new(move || host.tick()))
+            let (host, sizing) = (self.host.clone(), self.sizing.clone());
+            (
+                Parent::Win32(parent),
+                Box::new(move || {
+                    host.tick();
+                    sizing.tick();
+                }),
+            )
         };
         #[cfg(not(target_os = "windows"))]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = (Parent::X11(parent as usize as std::ffi::c_ulong), Box::new(|| {}));
-        *window = editor::open(parent, P::EDITOR_SIZE, self.scale.clone(), self.shared.editor(self.host.cx.clone()), on_frame);
+        *window = editor::open(parent, self.sizing.geometry.clone(), self.shared.editor(self.host.cx.clone()), on_frame);
         if window.is_none() {
             return kResultFalse;
         }
         #[cfg(target_os = "linux")]
         self.start_timer();
+        self.connect_resize();
         kResultOk
     }
 
-    /// The window's own thread on Linux is not the host's UI thread, so the latency and the editor's
-    /// changes go out from a timer on the host's run loop instead. Without one the latency waits for
-    /// the next `setActive(false)`.
+    /// The window's own thread on Linux is not the host's UI thread, so the latency, the editor's
+    /// changes and the sizes it asks for go out from a timer on the host's run loop instead. Without
+    /// one the latency waits for the next `setActive(false)`, and the editor cannot ask for a size.
     #[cfg(target_os = "linux")]
     fn start_timer(&self) {
-        let frame = self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let frame = self.sizing.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(run_loop) = frame.and_then(|frame| frame.cast::<Linux::IRunLoop>()) else { return };
-        let Some(handler) = ComWrapper::new(Ticker(self.host.clone())).to_com_ptr::<Linux::ITimerHandler>() else { return };
+        let ticker = Ticker { host: self.host.clone(), sizing: self.sizing.clone() };
+        let Some(handler) = ComWrapper::new(ticker).to_com_ptr::<Linux::ITimerHandler>() else { return };
         if unsafe { run_loop.registerTimer(handler.as_ptr(), TIMER_MS) } == kResultOk {
             *self.timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(Timer { run_loop, handler });
         }
     }
 
+    /// The editor may ask from any thread, and `resizeView` must be called on the UI thread, so the
+    /// size waits there for the next tick.
+    fn connect_resize(&self) {
+        if !P::RESIZABLE {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if self.timer.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            return;
+        }
+        let sizing = self.sizing.clone();
+        self.host.cx.connect_resize(Box::new(move |size| {
+            *sizing.requested.lock().unwrap_or_else(|e| e.into_inner()) = Some(sizing.geometry.fit(size));
+            true
+        }));
+    }
+
+    /// What the editor did last reaches the host before the view is gone, e.g. the end of a gesture
+    /// that would otherwise leave the host writing automation.
     fn close(&self) {
         #[cfg(target_os = "linux")]
         self.timer.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Ok(mut window) = self.window.try_lock() {
             window.take();
         }
+        self.host.cx.disconnect_resize();
+        self.sizing.requested.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.host.tick();
     }
 }
 
 impl<P: Plugin> Drop for View<P> {
     fn drop(&mut self) {
         guard((), || self.close())
+    }
+}
+
+/// What resizing the view needs on the UI thread, shared with what runs there for the open editor.
+struct Sizing {
+    geometry: editor::Geometry,
+    frame: Mutex<Option<ComPtr<IPlugFrame>>>,
+    /// This view as the host holds it, for `resizeView`; not a reference, so it does not keep itself alive.
+    this: AtomicPtr<IPlugView>,
+    /// What the editor asked for, at a scale of 1.0.
+    requested: Mutex<Option<(u32, u32)>>,
+}
+
+impl Sizing {
+    /// On the UI thread only. True when the host resized the view to `size`, in the platform's
+    /// pixels; it may have told the view with `onSize` already.
+    fn ask(&self, (width, height): (u32, u32)) -> bool {
+        let frame = self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let this = self.this.load(Ordering::Acquire);
+        let Some(frame) = frame.filter(|_| !this.is_null()) else { return false };
+        let mut rect = ViewRect { left: 0, top: 0, right: width as int32, bottom: height as int32 };
+        unsafe { frame.resizeView(this, &mut rect) == kResultOk }
+    }
+
+    /// What waits for the UI thread.
+    fn tick(&self) {
+        let Some(size) = self.requested.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        if self.ask(self.geometry.of(size)) {
+            self.geometry.resize(size);
+        }
     }
 }
 
@@ -919,7 +979,10 @@ impl Drop for Timer {
 }
 
 #[cfg(target_os = "linux")]
-struct Ticker(Arc<Host>);
+struct Ticker {
+    host: Arc<Host>,
+    sizing: Arc<Sizing>,
+}
 
 #[cfg(target_os = "linux")]
 impl Class for Ticker {
@@ -930,9 +993,16 @@ impl Class for Ticker {
 impl Linux::ITimerHandlerTrait for Ticker {
     unsafe fn onTimer(&self) {
         // The host may unregister and release this handler from inside `restartComponent`.
-        let host = self.0.clone();
-        guard((), || host.tick())
+        let (host, sizing) = (self.host.clone(), self.sizing.clone());
+        guard((), || {
+            host.tick();
+            sizing.tick();
+        })
     }
+}
+
+fn extent(rect: &ViewRect) -> (u32, u32) {
+    (u32::try_from(rect.right - rect.left).unwrap_or(0), u32::try_from(rect.bottom - rect.top).unwrap_or(0))
 }
 
 impl<P: Plugin> IPlugViewTrait for View<P> {
@@ -968,17 +1038,22 @@ impl<P: Plugin> IPlugViewTrait for View<P> {
             if size.is_null() {
                 return kInvalidArgument;
             }
-            let (width, height) = self.scale.of(P::EDITOR_SIZE);
+            let (width, height) = self.sizing.geometry.physical();
             unsafe { size.write(ViewRect { left: 0, top: 0, right: width as int32, bottom: height as int32 }) };
             kResultOk
         })
     }
 
+    /// Takes a size `checkSizeConstraint` would leave as it is, and refuses any other.
     unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
         guard(kInternalError, || {
             let Some(rect) = (unsafe { new_size.as_ref() }) else { return kInvalidArgument };
-            let (width, height) = self.scale.of(P::EDITOR_SIZE);
-            if (rect.right - rect.left, rect.bottom - rect.top) == (width as int32, height as int32) { kResultOk } else { kResultFalse }
+            let size = extent(rect);
+            if self.sizing.geometry.fit_physical(size) != size {
+                return kResultFalse;
+            }
+            self.sizing.geometry.resize_physical(size);
+            kResultOk
         })
     }
 
@@ -989,19 +1064,19 @@ impl<P: Plugin> IPlugViewTrait for View<P> {
     unsafe fn setFrame(&self, frame: *mut IPlugFrame) -> tresult {
         guard(kInternalError, || {
             let frame = unsafe { ComRef::from_raw(frame) }.map(|f| f.to_com_ptr());
-            *self.frame.lock().unwrap_or_else(|e| e.into_inner()) = frame;
+            *self.sizing.frame.lock().unwrap_or_else(|e| e.into_inner()) = frame;
             kResultOk
         })
     }
 
     unsafe fn canResize(&self) -> tresult {
-        kResultFalse
+        if P::RESIZABLE { kResultTrue } else { kResultFalse }
     }
 
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         guard(kInternalError, || {
             let Some(rect) = (unsafe { rect.as_mut() }) else { return kInvalidArgument };
-            let (width, height) = self.scale.of(P::EDITOR_SIZE);
+            let (width, height) = self.sizing.geometry.fit_physical(extent(rect));
             rect.right = rect.left + width as int32;
             rect.bottom = rect.top + height as int32;
             kResultTrue
@@ -1012,17 +1087,14 @@ impl<P: Plugin> IPlugViewTrait for View<P> {
 impl<P: Plugin> IPlugViewContentScaleSupportTrait for View<P> {
     unsafe fn setContentScaleFactor(&self, factor: IPlugViewContentScaleSupport_::ScaleFactor) -> tresult {
         guard(kInternalError, || {
-            let before = self.scale.of(P::EDITOR_SIZE);
-            if !self.scale.set(factor as f64) {
+            let geometry = &self.sizing.geometry;
+            let before = geometry.physical();
+            if !geometry.set_scale(factor as f64) {
                 return kResultFalse;
             }
-            let (width, height) = self.scale.of(P::EDITOR_SIZE);
             let open = self.window.try_lock().is_ok_and(|window| window.is_some());
-            let frame = self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let this = self.this.load(Ordering::Acquire);
-            if open && (width, height) != before && !this.is_null() && let Some(frame) = frame {
-                let mut rect = ViewRect { left: 0, top: 0, right: width as int32, bottom: height as int32 };
-                unsafe { frame.resizeView(this, &mut rect) };
+            if open && geometry.physical() != before {
+                self.sizing.ask(geometry.physical());
             }
             kResultTrue
         })
@@ -1225,6 +1297,9 @@ mod tests {
     struct RunLoop {
         timer: Mutex<Option<ComPtr<Linux::ITimerHandler>>>,
         unregistered: AtomicI32,
+        /// Resizes the view as asked, as a host does, rather than refuse.
+        resizes: AtomicBool,
+        asked: Mutex<Vec<(i32, i32)>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1234,8 +1309,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl IPlugFrameTrait for RunLoop {
-        unsafe fn resizeView(&self, _: *mut IPlugView, _: *mut ViewRect) -> tresult {
-            kResultFalse
+        unsafe fn resizeView(&self, view: *mut IPlugView, rect: *mut ViewRect) -> tresult {
+            let rect = unsafe { &mut *rect };
+            self.asked.lock().unwrap().push((rect.right - rect.left, rect.bottom - rect.top));
+            if !self.resizes.load(Ordering::SeqCst) {
+                return kResultFalse;
+            }
+            unsafe { ComRef::<IPlugView>::from_raw(view).unwrap().onSize(rect) }
         }
     }
 
@@ -1315,11 +1395,9 @@ mod tests {
     }
 
     /// One parameter from 0 to 10; keeps the context it is attached to.
-    #[cfg(target_os = "linux")]
     #[derive(Default)]
     struct Attached(Mutex<Option<GuiContext>>);
 
-    #[cfg(target_os = "linux")]
     impl Shared for Attached {
         fn params(&self) -> &'static [ParamInfo] {
             &[ParamInfo { id: 3, name: "Level", kind: Kind::Float { min: 0.0, max: 10.0, map: crate::Map::Linear }, default: 0.0, automatable: true }]
@@ -1348,10 +1426,8 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     struct Leveller;
 
-    #[cfg(target_os = "linux")]
     impl Plugin for Leveller {
         const INFO: Info = Doubler::INFO;
         const EDITOR_SIZE: (u32, u32) = (1, 1);
@@ -1372,16 +1448,13 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[derive(Default)]
     struct Edits(Mutex<Vec<String>>);
 
-    #[cfg(target_os = "linux")]
     impl Class for Edits {
         type Interfaces = (IComponentHandler,);
     }
 
-    #[cfg(target_os = "linux")]
     impl IComponentHandlerTrait for Edits {
         unsafe fn beginEdit(&self, id: ParamID) -> tresult {
             self.0.lock().unwrap().push(format!("begin {id}"));
@@ -1430,6 +1503,168 @@ mod tests {
             timer.onTimer();
             assert_eq!(*edits.0.lock().unwrap(), ["begin 3", "perform 3 0.25", "end 3", &format!("restart {kParamValuesChanged}")]);
             assert_eq!(plug_view.removed(), kResultOk);
+        }
+    }
+
+    #[test]
+    fn removing_the_view_delivers_what_the_editor_did_last() {
+        unsafe {
+            let wrapper = ComWrapper::new(Component::<Leveller>::new());
+            let edits = ComWrapper::new(Edits::default());
+            let controller = wrapper.to_com_ptr::<IEditController>().unwrap();
+            assert_eq!(controller.setComponentHandler(edits.to_com_ptr::<IComponentHandler>().unwrap().as_ptr()), kResultOk);
+            let cx = wrapper.shared.0.lock().unwrap().clone().expect("attached once the handler is known");
+            let view = ComWrapper::new(View::<Leveller>::new(&wrapper));
+            let plug_view = view.to_com_ptr::<IPlugView>().unwrap();
+            std::thread::spawn(move || {
+                cx.begin(3);
+                cx.set(3, 2.5);
+                cx.end(3);
+            })
+            .join()
+            .unwrap();
+            assert!(edits.0.lock().unwrap().is_empty(), "nothing reaches the handler off the UI thread");
+            assert_eq!(plug_view.removed(), kResultOk);
+            assert_eq!(*edits.0.lock().unwrap(), ["begin 3", "perform 3 0.25", "end 3"], "the gesture is not left open");
+        }
+    }
+
+    /// Keeps the editor's size, as a plugin would in its state.
+    struct Remembers(Mutex<Option<(u32, u32)>>);
+
+    impl Shared for Remembers {
+        fn params(&self) -> &'static [ParamInfo] {
+            &[]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {}
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self, _: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+            Box::new(|_| {})
+        }
+        fn editor_size(&self) -> Option<(u32, u32)> {
+            *self.0.lock().unwrap()
+        }
+        fn set_editor_size(&self, width: u32, height: u32) {
+            *self.0.lock().unwrap() = Some((width, height));
+        }
+    }
+
+    struct Wide;
+
+    impl Plugin for Wide {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1180, 680);
+        const RESIZABLE: bool = true;
+        const EDITOR_MIN: (u32, u32) = (760, 440);
+        type Shared = Remembers;
+        fn new() -> (Self, Arc<Remembers>) {
+            (Wide, Arc::new(Remembers(Mutex::new(Some((1000, 500))))))
+        }
+        fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
+            0
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, _: Block<'_>) {}
+        fn take_latency_changed(&mut self) -> bool {
+            false
+        }
+    }
+
+    fn rect(view: &ComPtr<IPlugView>) -> (i32, i32) {
+        let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+        assert_eq!(unsafe { view.getSize(&mut rect) }, kResultOk);
+        (rect.right - rect.left, rect.bottom - rect.top)
+    }
+
+    #[test]
+    fn vst3_check_size_constraint_clamps() {
+        unsafe {
+            let wrapper = ComWrapper::new(Component::<Wide>::new());
+            let controller = wrapper.to_com_ptr::<IEditController>().unwrap();
+            let view = ComPtr::<IPlugView>::from_raw(controller.createView(c"editor".as_ptr())).expect("an editor view");
+            assert_eq!(view.canResize(), kResultTrue);
+            assert_eq!(rect(&view), (1000, 500), "the size the plugin kept");
+
+            let mut wanted = ViewRect { left: 10, top: 20, right: 30, bottom: 40 };
+            assert_eq!(view.checkSizeConstraint(&mut wanted), kResultTrue);
+            assert_eq!((wanted.left, wanted.top, wanted.right, wanted.bottom), (10, 20, 770, 460));
+            let mut wanted = ViewRect { left: 0, top: 0, right: 2000, bottom: 300 };
+            assert_eq!(view.checkSizeConstraint(&mut wanted), kResultTrue);
+            assert_eq!((wanted.right, wanted.bottom), (2000, 440));
+
+            let scaling = view.cast::<IPlugViewContentScaleSupport>().unwrap();
+            assert_eq!(scaling.setContentScaleFactor(2.0), kResultTrue);
+            let mut wanted = ViewRect { left: 0, top: 0, right: 10, bottom: 10 };
+            assert_eq!(view.checkSizeConstraint(&mut wanted), kResultTrue);
+            assert_eq!((wanted.right, wanted.bottom), (1520, 880), "at the host's scale");
+            let mut small = ViewRect { left: 0, top: 0, right: 1520, bottom: 879 };
+            assert_eq!(view.onSize(&mut small), kResultFalse);
+            let mut large = ViewRect { left: 5, top: 5, right: 2005, bottom: 1205 };
+            assert_eq!(view.onSize(&mut large), kResultOk);
+            assert_eq!(rect(&view), (2000, 1200));
+            assert_eq!(wrapper.shared.editor_size(), Some((1000, 600)), "kept at a scale of 1.0");
+
+            let again = ComPtr::<IPlugView>::from_raw(controller.createView(c"editor".as_ptr())).unwrap();
+            assert_eq!(rect(&again), (1000, 600), "a new view opens at the size the last was left at");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_editor_asks_for_a_size_from_the_hosts_ui_thread() {
+        use Linux::ITimerHandlerTrait;
+        unsafe {
+            let wrapper = ComWrapper::new(Component::<Wide>::new());
+            let view = ComWrapper::new(View::<Wide>::new(&wrapper));
+            let plug_view = view.to_com_ptr::<IPlugView>().unwrap();
+            view.sizing.this.store(plug_view.as_ptr(), Ordering::Release);
+            let run_loop = ComWrapper::new(RunLoop::default());
+            run_loop.resizes.store(true, Ordering::SeqCst);
+            assert_eq!(plug_view.setFrame(run_loop.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()), kResultOk);
+            let scaling = plug_view.cast::<IPlugViewContentScaleSupport>().unwrap();
+            assert_eq!(scaling.setContentScaleFactor(1.5), kResultTrue);
+            let cx = wrapper.host.cx.clone();
+            assert!(!cx.request_resize(900, 900), "nothing to resize without a window");
+
+            // What `attached` does once the window is open, which needs a display.
+            view.start_timer();
+            view.connect_resize();
+            let timer = run_loop.timer.lock().unwrap().clone().expect("a timer on the host's run loop");
+            let asking = cx.clone();
+            assert!(std::thread::spawn(move || asking.request_resize(100, 2000)).join().unwrap());
+            assert!(run_loop.asked.lock().unwrap().is_empty(), "the host is asked on its UI thread only");
+            timer.onTimer();
+            assert_eq!(*run_loop.asked.lock().unwrap(), [(1140, 3000)]);
+            assert_eq!(rect(&plug_view), (1140, 3000));
+            assert_eq!(wrapper.shared.editor_size(), Some((760, 2000)));
+            timer.onTimer();
+            assert_eq!(run_loop.asked.lock().unwrap().len(), 1, "asked once");
+
+            run_loop.resizes.store(false, Ordering::SeqCst);
+            assert!(cx.request_resize(900, 900));
+            timer.onTimer();
+            assert_eq!(rect(&plug_view), (1140, 3000), "a refused size is not taken");
+
+            assert_eq!(plug_view.removed(), kResultOk);
+            assert!(!cx.request_resize(900, 900), "nothing to resize once the view is removed");
+            assert_eq!(plug_view.setFrame(ptr::null_mut()), kResultOk);
         }
     }
 }
