@@ -17,21 +17,28 @@ pub struct Info {
     pub vst3_subcategories: &'static str,
 }
 
-/// Inputs on the main input bus the host chose: 1 (mono in, stereo out) or 2 (stereo/stereo).
-pub trait Plugin: Send + 'static {
-    const INFO: Info;
-    const EDITOR_SIZE: (u32, u32);
-    fn new() -> Self;
+/// The half of a plugin that any thread may use at any time, also while the audio half processes.
+pub trait Shared: Send + Sync + 'static {
     fn params(&self) -> &'static [ParamInfo];
-    /// Plain values; callable from any thread.
+    /// Plain values.
     fn param(&self, id: u32) -> f64;
     /// Ignores unknown ids and clamps through `ParamInfo::clamp`.
     fn set_param(&self, id: u32, plain: f64);
     fn param_text(&self, id: u32, plain: f64) -> String;
     fn param_from_text(&self, id: u32, text: &str) -> Option<f64>;
     fn save(&self) -> Vec<u8>;
-    /// Callable from any thread, also while processing.
     fn load(&self, bytes: &[u8]) -> bool;
+    /// Called on the GUI thread for every frame while the window is open.
+    fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send>;
+}
+
+/// The audio half, which the wrapper only ever uses from one thread at a time.
+pub trait Plugin: Send + Sized + 'static {
+    const INFO: Info;
+    const EDITOR_SIZE: (u32, u32);
+    type Shared: Shared;
+    fn new() -> (Self, std::sync::Arc<Self::Shared>);
+    /// `inputs` is the main input bus the host chose: 1 (mono in, stereo out) or 2 (stereo/stereo).
     /// Returns the latency to report.
     fn activate(&mut self, sample_rate: f64, max_block: usize, inputs: usize) -> u32;
     fn deactivate(&mut self);
@@ -41,8 +48,6 @@ pub trait Plugin: Send + 'static {
     fn process(&mut self, channels: &mut [&mut [f32]]);
     /// True once after `process` changed the latency; the wrapper then tells the host.
     fn take_latency_changed(&mut self) -> bool;
-    /// Called on the GUI thread for every frame while the window is open.
-    fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send>;
 }
 
 /// Exports `$plugin` as the library's CLAP plugin through the `clap_entry` symbol.

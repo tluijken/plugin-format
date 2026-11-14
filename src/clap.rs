@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[doc(hidden)]
@@ -24,7 +24,7 @@ use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_ERROR, clap_process,
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
-use crate::Plugin;
+use crate::{Plugin, Shared};
 
 fn guard<R>(failed: R, body: impl FnOnce() -> R) -> R {
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(failed)
@@ -130,14 +130,14 @@ impl<P: Plugin> Factory<P> {
     }
 }
 
-/// `plugin` is touched through `&mut` only by `activate`, `deactivate` and `destroy` (main
-/// thread, never while processing, per CLAP) and by `process` (audio thread, only while active).
-/// Everything else takes `&P` and relies on `Plugin`'s `&self` methods being callable from any
-/// thread.
-struct Instance<P> {
+/// `plugin` is used by the main thread only in `activate`, `deactivate`, `destroy` and, while
+/// inactive, `latency.get`, which CLAP never runs alongside processing; by the audio thread only
+/// in `process`, while active. Everything any thread may call goes through `shared`.
+struct Instance<P: Plugin> {
     clap: clap_plugin,
     host: *const clap_host,
     plugin: UnsafeCell<P>,
+    shared: Arc<P::Shared>,
     active: AtomicBool,
     inputs: AtomicU32,
     /// What `activate` reported; the host only learns a new latency by reactivating.
@@ -146,6 +146,7 @@ struct Instance<P> {
 
 impl<P: Plugin> Instance<P> {
     fn create(host: *const clap_host, desc: &'static clap_plugin_descriptor) -> *const clap_plugin {
+        let (plugin, shared) = P::new();
         let instance = Box::into_raw(Box::new(Instance {
             clap: clap_plugin {
                 desc,
@@ -162,7 +163,8 @@ impl<P: Plugin> Instance<P> {
                 on_main_thread: Some(Self::on_main_thread),
             },
             host,
-            plugin: UnsafeCell::new(P::new()),
+            plugin: UnsafeCell::new(plugin),
+            shared,
             active: AtomicBool::new(false),
             inputs: AtomicU32::new(1),
             latency: AtomicU32::new(0),
@@ -180,10 +182,6 @@ impl<P: Plugin> Instance<P> {
             }
             Some(&*((*plugin).plugin_data as *const Self))
         }
-    }
-
-    fn plugin(&self) -> &P {
-        unsafe { &*self.plugin.get() }
     }
 
     /// Callers hold the exclusivity described on `Instance`.
@@ -331,13 +329,13 @@ impl<P: Plugin> Instance<P> {
                     continue;
                 }
                 let event = &*(header as *const clap_event_param_value);
-                self.plugin().set_param(event.param_id, event.value);
+                self.shared.set_param(event.param_id, event.value);
             }
         }
     }
 
     fn info(&self, id: clap_id) -> Option<&'static crate::ParamInfo> {
-        self.plugin().params().iter().find(|p| p.id == id)
+        self.shared.params().iter().find(|p| p.id == id)
     }
 
     unsafe extern "C" fn get_extension(plugin: *const clap_plugin, id: *const c_char) -> *const c_void {
@@ -371,12 +369,12 @@ impl<P: Plugin> Instance<P> {
     };
 
     unsafe extern "C" fn param_count(plugin: *const clap_plugin) -> u32 {
-        Self::with(plugin, || 0, |instance| instance.plugin().params().len() as u32)
+        Self::with(plugin, || 0, |instance| instance.shared.params().len() as u32)
     }
 
     unsafe extern "C" fn param_info(plugin: *const clap_plugin, index: u32, out: *mut clap_param_info) -> bool {
         Self::with(plugin, || false, |instance| {
-            let Some(info) = instance.plugin().params().get(index as usize) else { return false };
+            let Some(info) = instance.shared.params().get(index as usize) else { return false };
             if out.is_null() {
                 return false;
             }
@@ -405,7 +403,7 @@ impl<P: Plugin> Instance<P> {
             if out.is_null() || instance.info(id).is_none() {
                 return false;
             }
-            unsafe { out.write(instance.plugin().param(id)) };
+            unsafe { out.write(instance.shared.param(id)) };
             true
         })
     }
@@ -416,7 +414,7 @@ impl<P: Plugin> Instance<P> {
                 return false;
             }
             let out = unsafe { std::slice::from_raw_parts_mut(out, capacity as usize) };
-            copy_str(&instance.plugin().param_text(id, value), out);
+            copy_str(&instance.shared.param_text(id, value), out);
             true
         })
     }
@@ -427,7 +425,7 @@ impl<P: Plugin> Instance<P> {
                 return false;
             }
             let Ok(text) = unsafe { CStr::from_ptr(text) }.to_str() else { return false };
-            let Some(value) = instance.plugin().param_from_text(id, text) else { return false };
+            let Some(value) = instance.shared.param_from_text(id, text) else { return false };
             unsafe { out.write(value) };
             true
         })
@@ -442,7 +440,7 @@ impl<P: Plugin> Instance<P> {
     unsafe extern "C" fn save(plugin: *const clap_plugin, stream: *const clap_ostream) -> bool {
         Self::with(plugin, || false, |instance| unsafe {
             let Some(write) = stream.as_ref().and_then(|s| s.write) else { return false };
-            let bytes = instance.plugin().save();
+            let bytes = instance.shared.save();
             let mut rest = &bytes[..];
             while !rest.is_empty() {
                 let written = write(stream, rest.as_ptr() as *const c_void, rest.len() as u64);
@@ -470,7 +468,7 @@ impl<P: Plugin> Instance<P> {
                 }
                 bytes.extend_from_slice(&chunk[..(got as usize).min(chunk.len())]);
             }
-            if !instance.plugin().load(&bytes) {
+            if !instance.shared.load(&bytes) {
                 return false;
             }
             instance.rescan_values();
@@ -493,7 +491,7 @@ impl<P: Plugin> Instance<P> {
 
     unsafe extern "C" fn latency(plugin: *const clap_plugin) -> u32 {
         Self::with(plugin, || 0, |instance| {
-            if instance.active.load(Ordering::Acquire) { instance.latency.load(Ordering::Relaxed) } else { instance.plugin().latency() }
+            if instance.active.load(Ordering::Acquire) { instance.latency.load(Ordering::Relaxed) } else { unsafe { instance.plugin_mut() }.latency() }
         })
     }
 
@@ -634,27 +632,9 @@ mod tests {
     use super::*;
     use crate::{Info, Kind, ParamInfo};
 
-    static RESTARTS: AtomicUsize = AtomicUsize::new(0);
+    struct Fixed;
 
-    struct Doubler {
-        changed: bool,
-    }
-
-    impl Plugin for Doubler {
-        const INFO: Info = Info {
-            name: "Doubler",
-            vendor: "test",
-            version: "0",
-            clap_id: "test.doubler",
-            description: "",
-            clap_features: &[c"audio-effect"],
-            vst3_class_id: [0; 16],
-            vst3_subcategories: "Fx",
-        };
-        const EDITOR_SIZE: (u32, u32) = (1, 1);
-        fn new() -> Self {
-            Doubler { changed: false }
-        }
+    impl Shared for Fixed {
         fn params(&self) -> &'static [ParamInfo] {
             const PARAMS: &[ParamInfo] = &[ParamInfo { id: 7, name: "Gain", kind: Kind::Bool, default: 1.0, automatable: true }];
             PARAMS
@@ -675,6 +655,33 @@ mod tests {
         fn load(&self, _: &[u8]) -> bool {
             true
         }
+        fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send> {
+            Box::new(|_| {})
+        }
+    }
+
+    static RESTARTS: AtomicUsize = AtomicUsize::new(0);
+
+    struct Doubler {
+        changed: bool,
+    }
+
+    impl Plugin for Doubler {
+        const INFO: Info = Info {
+            name: "Doubler",
+            vendor: "test",
+            version: "0",
+            clap_id: "test.doubler",
+            description: "",
+            clap_features: &[c"audio-effect"],
+            vst3_class_id: [0; 16],
+            vst3_subcategories: "Fx",
+        };
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        type Shared = Fixed;
+        fn new() -> (Self, Arc<Fixed>) {
+            (Doubler { changed: false }, Arc::new(Fixed))
+        }
         fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
             5
         }
@@ -690,9 +697,6 @@ mod tests {
         }
         fn take_latency_changed(&mut self) -> bool {
             std::mem::take(&mut self.changed)
-        }
-        fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send> {
-            Box::new(|_| {})
         }
     }
 
