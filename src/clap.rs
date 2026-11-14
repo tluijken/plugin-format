@@ -205,7 +205,7 @@ impl<P: Plugin> Instance<P> {
 
     unsafe extern "C" fn activate(plugin: *const clap_plugin, sample_rate: f64, _min: u32, max: u32) -> bool {
         Self::with(plugin, || false, |instance| {
-            if instance.active.load(Ordering::Acquire) {
+            if max == 0 || instance.active.load(Ordering::Acquire) {
                 return false;
             }
             let inputs = instance.inputs.load(Ordering::Relaxed) as usize;
