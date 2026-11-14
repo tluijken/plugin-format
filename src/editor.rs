@@ -17,22 +17,30 @@ pub enum Parent {
 
 /// The open editor, closed when dropped. Not `Send`, so it is closed on the thread that opened it,
 /// which Windows requires of a window.
-pub struct Window(ManuallyDrop<baseview::Window>);
+pub struct Window {
+    window: ManuallyDrop<baseview::Window>,
+    #[cfg(target_os = "linux")]
+    finished: std::sync::Arc<x11::Finished>,
+}
 
 impl Window {
     pub fn show(&self) -> bool {
-        self.0.show().is_ok()
+        self.window.show().is_ok()
     }
 
     pub fn hide(&self) -> bool {
-        self.0.hide().is_ok()
+        self.window.hide().is_ok()
     }
 }
 
 impl Drop for Window {
-    /// On Linux closing joins the window's thread and passes on its panic, which must not reach the host.
+    /// On X11 baseview's drop may return before its window thread is done, detaching it, and the
+    /// host may unload the library right after: so wait for the thread too. The panic baseview
+    /// passes on from that thread must not reach the host.
     fn drop(&mut self) {
-        let _ = catch_unwind(AssertUnwindSafe(|| unsafe { ManuallyDrop::drop(&mut self.0) }));
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe { ManuallyDrop::drop(&mut self.window) }));
+        #[cfg(target_os = "linux")]
+        self.finished.wait(x11::CLOSE_TIMEOUT);
     }
 }
 
@@ -45,8 +53,20 @@ pub fn open(parent: Parent, size: (u32, u32), ui: Box<dyn FnMut(&mut egui::Ui) +
         .with_size(NativeSize::new(size.0, size.1))
         .with_resizable(false)
         .with_parent(&parent);
-    let window = EguiWindow::create(settings, Editor { ui, on_frame }).ok()?;
-    let window = Window(ManuallyDrop::new(window));
+    #[cfg(target_os = "linux")]
+    let finished = std::sync::Arc::new(x11::Finished::default());
+    let editor = Editor {
+        ui,
+        on_frame,
+        #[cfg(target_os = "linux")]
+        finished: finished.clone(),
+    };
+    let window = EguiWindow::create(settings, editor).ok()?;
+    let window = Window {
+        window: ManuallyDrop::new(window),
+        #[cfg(target_os = "linux")]
+        finished,
+    };
     window.show().then_some(window)
 }
 
@@ -76,14 +96,121 @@ impl HasWindowHandle for Handle {
 struct Editor {
     ui: Box<dyn FnMut(&mut egui::Ui) + Send>,
     on_frame: Box<dyn FnMut() + Send>,
+    #[cfg(target_os = "linux")]
+    finished: std::sync::Arc<x11::Finished>,
 }
 
 impl App for Editor {
+    /// Runs on baseview's own thread on X11, before anything of the window exists on it.
+    fn build(&mut self, _ctx: egui::Context, _frame: &mut Frame) -> Result<(), baseview::HandlerError> {
+        #[cfg(target_os = "linux")]
+        x11::signal_on_thread_exit(self.finished.clone());
+        Ok(())
+    }
+
     /// On Windows this runs inside the window procedure, where a panic would unwind into the host.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
         let _ = catch_unwind(AssertUnwindSafe(|| {
             (self.on_frame)();
             (self.ui)(ui);
         }));
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod x11 {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[derive(Default)]
+    pub struct Finished {
+        done: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl Finished {
+        fn signal(&self) {
+            *self.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.changed.notify_all();
+        }
+
+        /// False when `timeout` passed first.
+        pub fn wait(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else { return false };
+                done = self.changed.wait_timeout(done, left).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            true
+        }
+    }
+
+    struct Signal(Arc<Finished>);
+
+    impl Drop for Signal {
+        fn drop(&mut self) {
+            self.0.signal();
+        }
+    }
+
+    thread_local! {
+        static ON_EXIT: RefCell<Vec<Signal>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Thread-local destructors run after everything the thread's closure owned has been dropped,
+    /// and glibc keeps the library loaded until they have run.
+    pub fn signal_on_thread_exit(finished: Arc<Finished>) {
+        ON_EXIT.with(|signals| signals.borrow_mut().push(Signal(finished)));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::*;
+
+        struct SlowDrop(Arc<AtomicBool>);
+
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(100));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn the_wait_ends_only_after_the_thread_has_dropped_what_it_owned() {
+            let finished = Arc::new(Finished::default());
+            let dropped = Arc::new(AtomicBool::new(false));
+            let owned = SlowDrop(dropped.clone());
+            let signalled = finished.clone();
+            let thread = std::thread::spawn(move || {
+                signal_on_thread_exit(signalled);
+                let _owned = owned;
+            });
+            assert!(finished.wait(Duration::from_secs(5)));
+            assert!(dropped.load(Ordering::SeqCst));
+            thread.join().unwrap();
+        }
+
+        #[test]
+        fn the_wait_gives_up_after_the_timeout() {
+            let finished = Finished::default();
+            let start = Instant::now();
+            assert!(!finished.wait(Duration::from_millis(30)));
+            assert!(start.elapsed() >= Duration::from_millis(30));
+        }
+
+        #[test]
+        fn a_finished_thread_ends_the_wait_at_once() {
+            let finished = Arc::new(Finished::default());
+            let signalled = finished.clone();
+            std::thread::spawn(move || signal_on_thread_exit(signalled)).join().unwrap();
+            assert!(finished.wait(Duration::ZERO));
+        }
     }
 }
