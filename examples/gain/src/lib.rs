@@ -1,19 +1,33 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
-use plugin_format::{Block, Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
+use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
 
 pub const GAIN: u32 = 0;
 pub const FREQUENCY: u32 = 1;
+pub const TEST_GESTURE: u32 = 2;
 
-pub const INFOS: [ParamInfo; 2] = [
+pub const INFOS: [ParamInfo; 3] = [
     ParamInfo { id: GAIN, name: "Gain", kind: Kind::Int { min: -60, max: 24 }, default: 0.0, automatable: true },
     ParamInfo { id: FREQUENCY, name: "Frequency", kind: Kind::Float { min: 20.0, max: 20000.0, map: Map::Log }, default: 1000.0, automatable: true },
+    ParamInfo { id: TEST_GESTURE, name: "Test gesture", kind: Kind::Bool, default: 0.0, automatable: false },
 ];
 
 pub struct GainShared {
     db: AtomicI32,
     frequency: AtomicU64,
+    cx: Mutex<Option<GuiContext>>,
+}
+
+impl GainShared {
+    /// What an editor does when a drag sets the gain to -6 dB, for the host tests to see without a window.
+    fn gesture(&self) {
+        let Some(cx) = self.cx.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+        cx.begin(GAIN);
+        cx.set(GAIN, -6.0);
+        cx.end(GAIN);
+        cx.mark_dirty();
+    }
 }
 
 impl Shared for GainShared {
@@ -33,6 +47,7 @@ impl Shared for GainShared {
         match id {
             GAIN => self.db.store(INFOS[0].clamp(plain) as i32, Ordering::Relaxed),
             FREQUENCY => self.frequency.store(INFOS[1].clamp(plain).to_bits(), Ordering::Relaxed),
+            TEST_GESTURE if plain >= 0.5 => self.gesture(),
             _ => {}
         }
     }
@@ -63,12 +78,16 @@ impl Shared for GainShared {
         true
     }
 
-    fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+    fn editor(&self, _: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
         Box::new(|root| {
             egui::CentralPanel::default().show(root, |ui| {
                 ui.heading("Gain");
             });
         })
+    }
+
+    fn attach(&self, cx: GuiContext) {
+        *self.cx.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx);
     }
 }
 
@@ -94,7 +113,7 @@ impl Plugin for Gain {
     type Shared = GainShared;
 
     fn new() -> (Self, Arc<GainShared>) {
-        let shared = Arc::new(GainShared { db: AtomicI32::new(0), frequency: AtomicU64::new(1000f64.to_bits()) });
+        let shared = Arc::new(GainShared { db: AtomicI32::new(0), frequency: AtomicU64::new(1000f64.to_bits()), cx: Mutex::new(None) });
         (Gain { shared: shared.clone(), inputs: 1 }, shared)
     }
 

@@ -3,7 +3,8 @@ use std::ffi::{CStr, c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::ThreadId;
 
 use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
 use vst3::Steinberg::Vst::BusInfo_::BusFlags_::kDefaultActive;
@@ -21,7 +22,8 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 use vst3::Steinberg::Linux::IRunLoopTrait;
 
 use crate::editor::{self, Parent};
-use crate::{Extras, Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
+use crate::gui_context::Event;
+use crate::{Extras, GuiContext, Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
 
 const CATEGORY: &str = "Audio Module Class";
 
@@ -201,12 +203,44 @@ struct Host {
     new_latency: AtomicU32,
     latency_changed: AtomicBool,
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
+    /// The thread that set the handler, which Steinberg makes the UI thread.
+    ui_thread: Mutex<Option<ThreadId>>,
+    params: &'static [ParamInfo],
+    cx: GuiContext,
 }
 
 impl Host {
+    fn new(latency: u32, shared: Weak<dyn Shared>) -> Arc<Self> {
+        let host = Arc::new(Host {
+            latency: AtomicU32::new(latency),
+            new_latency: AtomicU32::new(latency),
+            latency_changed: AtomicBool::new(false),
+            handler: Mutex::new(None),
+            ui_thread: Mutex::new(None),
+            params: shared.upgrade().map_or(&[], |shared| shared.params()),
+            cx: GuiContext::new(shared),
+        });
+        let weak = Arc::downgrade(&host);
+        // Steinberg wants the handler called on the UI thread, while the context may be used from any
+        // thread, on Linux from the editor's own. So a call from the UI thread is delivered at once and
+        // any other waits for the next delivery there: the open view's run-loop timer on Linux, the
+        // editor's frame on Windows (where the window runs on the UI thread), or a new handler.
+        host.cx.connect(Box::new(move |_| {
+            if let Some(host) = weak.upgrade()
+                && *host.ui_thread.lock().unwrap_or_else(|e| e.into_inner()) == Some(std::thread::current().id())
+            {
+                host.deliver();
+            }
+        }));
+        host
+    }
+
+    fn handler(&self) -> Option<ComPtr<IComponentHandler>> {
+        self.handler.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     fn restart(&self, flags: RestartFlags) {
-        let handler = self.handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(handler) = handler {
+        if let Some(handler) = self.handler() {
             unsafe { handler.restartComponent(flags) };
         }
     }
@@ -216,6 +250,33 @@ impl Host {
             self.latency.store(self.new_latency.load(Ordering::Acquire), Ordering::Release);
             self.restart(kLatencyChanged);
         }
+    }
+
+    /// On the UI thread only. Without a handler everything waits for one.
+    fn deliver(&self) {
+        let Some(handler) = self.handler() else { return };
+        self.cx.drain(|event| {
+            unsafe {
+                match event {
+                    Event::Begin(id) => handler.beginEdit(id),
+                    Event::Value(id, plain) => {
+                        let normalised = self.params.iter().find(|p| p.id == id).map_or(0.0, |info| info.normalise(plain));
+                        handler.performEdit(id, normalised)
+                    }
+                    Event::End(id) => handler.endEdit(id),
+                }
+            };
+            true
+        });
+        if self.cx.take_dirty() {
+            unsafe { handler.restartComponent(kParamValuesChanged) };
+        }
+    }
+
+    /// What waits for the UI thread.
+    fn tick(&self) {
+        self.announce_latency();
+        self.deliver();
     }
 }
 
@@ -237,6 +298,7 @@ impl<P: Plugin> Component<P> {
     fn new() -> Self {
         let (plugin, shared) = P::new();
         let latency = plugin.latency();
+        let weak: Weak<dyn Shared> = Arc::downgrade(&shared) as Weak<P::Shared>;
         Component {
             plugin: UnsafeCell::new(plugin),
             claimed: AtomicBool::new(false),
@@ -246,12 +308,7 @@ impl<P: Plugin> Component<P> {
             sidechain_active: AtomicBool::new(false),
             sample_rate: AtomicU64::new(0),
             max_block: AtomicU32::new(0),
-            host: Arc::new(Host {
-                latency: AtomicU32::new(latency),
-                new_latency: AtomicU32::new(latency),
-                latency_changed: AtomicBool::new(false),
-                handler: Mutex::new(None),
-            }),
+            host: Host::new(latency, weak),
         }
     }
 
@@ -709,7 +766,13 @@ impl<P: Plugin> IEditControllerTrait for Component<P> {
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
         guard(kInternalError, || {
             let handler = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr());
+            let known = handler.is_some();
             *self.host.handler.lock().unwrap_or_else(|e| e.into_inner()) = handler;
+            if known {
+                *self.host.ui_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+                self.shared.attach(self.host.cx.clone());
+                self.host.deliver();
+            }
             kResultOk
         })
     }
@@ -780,11 +843,11 @@ impl<P: Plugin> View<P> {
         #[cfg(target_os = "windows")]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = {
             let host = self.host.clone();
-            (Parent::Win32(parent), Box::new(move || host.announce_latency()))
+            (Parent::Win32(parent), Box::new(move || host.tick()))
         };
         #[cfg(not(target_os = "windows"))]
         let (parent, on_frame): (_, Box<dyn FnMut() + Send>) = (Parent::X11(parent as usize as std::ffi::c_ulong), Box::new(|| {}));
-        *window = editor::open(parent, P::EDITOR_SIZE, self.scale.clone(), self.shared.editor(), on_frame);
+        *window = editor::open(parent, P::EDITOR_SIZE, self.scale.clone(), self.shared.editor(self.host.cx.clone()), on_frame);
         if window.is_none() {
             return kResultFalse;
         }
@@ -793,8 +856,9 @@ impl<P: Plugin> View<P> {
         kResultOk
     }
 
-    /// The window's own thread on Linux is not the host's UI thread, so the latency is announced from
-    /// a timer on the host's run loop instead. Without one it waits for the next `setActive(false)`.
+    /// The window's own thread on Linux is not the host's UI thread, so the latency and the editor's
+    /// changes go out from a timer on the host's run loop instead. Without one the latency waits for
+    /// the next `setActive(false)`.
     #[cfg(target_os = "linux")]
     fn start_timer(&self) {
         let frame = self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -820,8 +884,9 @@ impl<P: Plugin> Drop for View<P> {
     }
 }
 
+/// About a frame, so a drag reaches the host's automation as smoothly as the editor draws it.
 #[cfg(target_os = "linux")]
-const TIMER_MS: u64 = 50;
+const TIMER_MS: u64 = 16;
 
 #[cfg(target_os = "linux")]
 struct Timer {
@@ -849,7 +914,7 @@ impl Linux::ITimerHandlerTrait for Ticker {
     unsafe fn onTimer(&self) {
         // The host may unregister and release this handler from inside `restartComponent`.
         let host = self.0.clone();
-        guard((), || host.announce_latency())
+        guard((), || host.tick())
     }
 }
 
@@ -978,7 +1043,7 @@ mod tests {
         fn load(&self, _: &[u8]) -> bool {
             true
         }
-        fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+        fn editor(&self, _: crate::GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
             Box::new(|_| {})
         }
     }
@@ -1229,6 +1294,125 @@ mod tests {
             assert_eq!(processor.setupProcessing(&mut setup), kResultFalse);
             assert_eq!(processor.process(ptr::null_mut()), kInvalidArgument);
             assert_eq!(processor.setBusArrangements(ptr::null_mut(), 1, ptr::null_mut(), 1), kResultFalse);
+        }
+    }
+
+    /// One parameter from 0 to 10; keeps the context it is attached to.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct Attached(Mutex<Option<GuiContext>>);
+
+    #[cfg(target_os = "linux")]
+    impl Shared for Attached {
+        fn params(&self) -> &'static [ParamInfo] {
+            &[ParamInfo { id: 3, name: "Level", kind: Kind::Float { min: 0.0, max: 10.0, map: crate::Map::Linear }, default: 0.0, automatable: true }]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {}
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self, _: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+            Box::new(|_| {})
+        }
+        fn attach(&self, cx: GuiContext) {
+            *self.0.lock().unwrap() = Some(cx);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct Leveller;
+
+    #[cfg(target_os = "linux")]
+    impl Plugin for Leveller {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        type Shared = Attached;
+        fn new() -> (Self, Arc<Attached>) {
+            (Leveller, Arc::default())
+        }
+        fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
+            0
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, _: Block<'_>) {}
+        fn take_latency_changed(&mut self) -> bool {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct Edits(Mutex<Vec<String>>);
+
+    #[cfg(target_os = "linux")]
+    impl Class for Edits {
+        type Interfaces = (IComponentHandler,);
+    }
+
+    #[cfg(target_os = "linux")]
+    impl IComponentHandlerTrait for Edits {
+        unsafe fn beginEdit(&self, id: ParamID) -> tresult {
+            self.0.lock().unwrap().push(format!("begin {id}"));
+            kResultOk
+        }
+        unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> tresult {
+            self.0.lock().unwrap().push(format!("perform {id} {value}"));
+            kResultOk
+        }
+        unsafe fn endEdit(&self, id: ParamID) -> tresult {
+            self.0.lock().unwrap().push(format!("end {id}"));
+            kResultOk
+        }
+        unsafe fn restartComponent(&self, flags: int32) -> tresult {
+            self.0.lock().unwrap().push(format!("restart {flags}"));
+            kResultOk
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_gesture_from_another_thread_waits_for_the_ui_thread() {
+        use Linux::ITimerHandlerTrait;
+        unsafe {
+            let wrapper = ComWrapper::new(Component::<Leveller>::new());
+            let edits = ComWrapper::new(Edits::default());
+            let controller = wrapper.to_com_ptr::<IEditController>().unwrap();
+            assert_eq!(controller.setComponentHandler(edits.to_com_ptr::<IComponentHandler>().unwrap().as_ptr()), kResultOk);
+            let cx = wrapper.shared.0.lock().unwrap().clone().expect("attached once the handler is known");
+            std::thread::spawn(move || {
+                cx.begin(3);
+                cx.set(3, 2.5);
+                cx.end(3);
+                cx.mark_dirty();
+            })
+            .join()
+            .unwrap();
+            assert!(edits.0.lock().unwrap().is_empty(), "nothing reaches the handler off the UI thread");
+
+            let view = ComWrapper::new(View::<Leveller>::new(&wrapper));
+            let plug_view = view.to_com_ptr::<IPlugView>().unwrap();
+            let run_loop = ComWrapper::new(RunLoop::default());
+            assert_eq!(plug_view.setFrame(run_loop.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()), kResultOk);
+            view.start_timer();
+            let timer = run_loop.timer.lock().unwrap().clone().expect("a timer on the host's run loop");
+            timer.onTimer();
+            assert_eq!(*edits.0.lock().unwrap(), ["begin 3", "perform 3 0.25", "end 3", &format!("restart {kParamValuesChanged}")]);
+            assert_eq!(plug_view.removed(), kResultOk);
         }
     }
 }

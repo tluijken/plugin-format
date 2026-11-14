@@ -8,20 +8,23 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
-use clap_sys::events::{CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, clap_event_header, clap_event_param_value, clap_input_events, clap_output_events};
+use clap_sys::events::{
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_VALUE, clap_event_header, clap_event_param_gesture,
+    clap_event_param_value, clap_input_events, clap_output_events,
+};
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11, clap_plugin_gui, clap_window, clap_window_handle};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags, clap_plugin_params};
-use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
-use gain::{FREQUENCY, GAIN};
+use gain::{FREQUENCY, GAIN, TEST_GESTURE};
 
 fn plugin_path() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -83,10 +86,29 @@ unsafe extern "C" fn rescan(_: *const clap_host, flags: clap_param_rescan_flags)
 }
 unsafe extern "C" fn clear(_: *const clap_host, _: u32, _: u32) {}
 
-static HOST_PARAMS: clap_host_params = clap_host_params { rescan: Some(rescan), clear: Some(clear), request_flush: Some(nothing) };
+static FLUSH_REQUESTS: AtomicU32 = AtomicU32::new(0);
+static CALLBACK_REQUESTS: AtomicU32 = AtomicU32::new(0);
+static DIRTY_MARKS: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn request_flush(_: *const clap_host) {
+    FLUSH_REQUESTS.fetch_add(1, Ordering::SeqCst);
+}
+unsafe extern "C" fn request_callback(_: *const clap_host) {
+    CALLBACK_REQUESTS.fetch_add(1, Ordering::SeqCst);
+}
+unsafe extern "C" fn mark_dirty(_: *const clap_host) {
+    DIRTY_MARKS.fetch_add(1, Ordering::SeqCst);
+}
+
+static HOST_PARAMS: clap_host_params = clap_host_params { rescan: Some(rescan), clear: Some(clear), request_flush: Some(request_flush) };
+static HOST_STATE: clap_host_state = clap_host_state { mark_dirty: Some(mark_dirty) };
 
 unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
-    if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PARAMS { &HOST_PARAMS as *const _ as *const c_void } else { ptr::null() }
+    match unsafe { CStr::from_ptr(id) } {
+        id if id == CLAP_EXT_PARAMS => &HOST_PARAMS as *const _ as *const c_void,
+        id if id == CLAP_EXT_STATE => &HOST_STATE as *const _ as *const c_void,
+        _ => ptr::null(),
+    }
 }
 
 static HOST: clap_host = clap_host {
@@ -99,7 +121,7 @@ static HOST: clap_host = clap_host {
     get_extension: Some(host_extension),
     request_restart: Some(nothing),
     request_process: Some(nothing),
-    request_callback: Some(nothing),
+    request_callback: Some(request_callback),
 };
 
 /// An initialised plugin instance from the shared library.
@@ -160,14 +182,50 @@ fn events(list: &Vec<clap_event_param_value>) -> clap_input_events {
 
 const OUT_EVENTS: clap_output_events = clap_output_events { ctx: ptr::null_mut(), try_push: Some(drop_event) };
 
+/// What the plugin sent, as the host's output event list received it.
+#[derive(Debug, PartialEq)]
+enum Sent {
+    Begin(u32),
+    Value(u32, f64),
+    End(u32),
+}
+
+unsafe extern "C" fn record_event(list: *const clap_output_events, header: *const clap_event_header) -> bool {
+    unsafe {
+        let sent = &mut *((*list).ctx as *mut Vec<Sent>);
+        assert_eq!((*header).space_id, CLAP_CORE_EVENT_SPACE_ID);
+        match (*header).type_ {
+            CLAP_EVENT_PARAM_GESTURE_BEGIN => sent.push(Sent::Begin((*(header as *const clap_event_param_gesture)).param_id)),
+            CLAP_EVENT_PARAM_GESTURE_END => sent.push(Sent::End((*(header as *const clap_event_param_gesture)).param_id)),
+            CLAP_EVENT_PARAM_VALUE => {
+                let event = &*(header as *const clap_event_param_value);
+                sent.push(Sent::Value(event.param_id, event.value));
+            }
+            other => panic!("unexpected event type {other}"),
+        }
+        true
+    }
+}
+
+unsafe extern "C" fn refuse_event(_: *const clap_output_events, _: *const clap_event_header) -> bool {
+    false
+}
+
+fn recorder(sent: &mut Vec<Sent>) -> clap_output_events {
+    clap_output_events { ctx: sent as *mut _ as *mut c_void, try_push: Some(record_event) }
+}
+
 /// Runs one block; `inputs` and `outputs` hold one slice per channel.
 unsafe fn run(plugin: *const clap_plugin, inputs: &mut [Vec<f32>], outputs: &mut [Vec<f32>], frames: u32, in_events: &clap_input_events) {
+    unsafe { run_with(plugin, inputs, outputs, frames, in_events, &OUT_EVENTS) }
+}
+
+unsafe fn run_with(plugin: *const clap_plugin, inputs: &mut [Vec<f32>], outputs: &mut [Vec<f32>], frames: u32, in_events: &clap_input_events, out_events: &clap_output_events) {
     unsafe {
         let mut in_ptrs: Vec<*mut f32> = inputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
         let mut out_ptrs: Vec<*mut f32> = outputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
         let input = clap_audio_buffer { data32: in_ptrs.as_mut_ptr(), data64: ptr::null_mut(), channel_count: inputs.len() as u32, latency: 0, constant_mask: 0 };
         let mut output = clap_audio_buffer { data32: out_ptrs.as_mut_ptr(), data64: ptr::null_mut(), channel_count: outputs.len() as u32, latency: 0, constant_mask: 0 };
-        let out_events = OUT_EVENTS;
         let process = clap_process {
             steady_time: 0,
             frames_count: frames,
@@ -177,7 +235,7 @@ unsafe fn run(plugin: *const clap_plugin, inputs: &mut [Vec<f32>], outputs: &mut
             audio_inputs_count: 1,
             audio_outputs_count: 1,
             in_events,
-            out_events: &out_events,
+            out_events,
         };
         ((*plugin).process.unwrap())(plugin, &process);
     }
@@ -199,7 +257,7 @@ fn loads_scans_and_processes() {
         assert_eq!(CStr::from_ptr((*desc).id).to_str().unwrap(), "plugin-format.gain");
 
         let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
-        assert_eq!((params.count.unwrap())(plugin), 2);
+        assert_eq!((params.count.unwrap())(plugin), 3);
         let mut info: clap_param_info = std::mem::zeroed();
         assert!((params.get_info.unwrap())(plugin, 0, &mut info));
         assert_eq!(info.id, GAIN);
@@ -493,6 +551,78 @@ fn the_gui_takes_the_hosts_scale_and_reports_its_size_in_it() {
         (gui.destroy.unwrap())(plugin);
         assert!((gui.create.unwrap())(plugin, NATIVE_API.as_ptr(), false));
         assert_eq!(size(), (200, 100), "a new gui starts at 1.0 until the host says otherwise");
+        ((*plugin).destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+#[test]
+fn gesture_reaches_the_clap_host_in_order() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
+        let mut info: clap_param_info = std::mem::zeroed();
+        assert!((params.get_info.unwrap())(plugin, 2, &mut info));
+        assert_eq!((info.id, info.flags & CLAP_PARAM_IS_AUTOMATABLE), (TEST_GESTURE, 0));
+
+        let requests = FLUSH_REQUESTS.load(Ordering::SeqCst);
+        let mut sent = Vec::new();
+        let trigger = vec![param_event(TEST_GESTURE, 1.0)];
+        (params.flush.unwrap())(plugin, &events(&trigger), &recorder(&mut sent));
+        assert!(FLUSH_REQUESTS.load(Ordering::SeqCst) > requests, "the host is asked to flush");
+        let none = Vec::new();
+        (params.flush.unwrap())(plugin, &events(&none), &recorder(&mut sent));
+        assert_eq!(sent, [Sent::Begin(GAIN), Sent::Value(GAIN, -6.0), Sent::End(GAIN)]);
+        let mut value = 0.0;
+        assert!((params.get_value.unwrap())(plugin, GAIN, &mut value));
+        assert_eq!(value, -6.0, "the shared value changes at once");
+        ((*plugin).destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+#[test]
+fn a_gesture_the_host_refused_goes_out_with_the_next_block() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let p = &*plugin;
+        let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
+        let trigger = vec![param_event(TEST_GESTURE, 1.0)];
+        let full = clap_output_events { ctx: ptr::null_mut(), try_push: Some(refuse_event) };
+        (params.flush.unwrap())(plugin, &events(&trigger), &full);
+
+        assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 64));
+        assert!((p.start_processing.unwrap())(plugin));
+        let mut sent = Vec::new();
+        let none = Vec::new();
+        run_with(plugin, &mut [vec![0.0; 64]], &mut [vec![0.0; 64], vec![0.0; 64]], 64, &events(&none), &recorder(&mut sent));
+        assert_eq!(sent, [Sent::Begin(GAIN), Sent::Value(GAIN, -6.0), Sent::End(GAIN)]);
+        run_with(plugin, &mut [vec![0.0; 64]], &mut [vec![0.0; 64], vec![0.0; 64]], 64, &events(&none), &recorder(&mut sent));
+        assert_eq!(sent.len(), 3, "sent once");
+        (p.stop_processing.unwrap())(plugin);
+        (p.deactivate.unwrap())(plugin);
+        (p.destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+#[test]
+fn mark_dirty_reaches_the_host() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
+        let (callbacks, marks) = (CALLBACK_REQUESTS.load(Ordering::SeqCst), DIRTY_MARKS.load(Ordering::SeqCst));
+        let trigger = vec![param_event(TEST_GESTURE, 1.0)];
+        (params.flush.unwrap())(plugin, &events(&trigger), &OUT_EVENTS);
+        assert!(CALLBACK_REQUESTS.load(Ordering::SeqCst) > callbacks, "the host is asked for a main-thread callback");
+        assert_eq!(DIRTY_MARKS.load(Ordering::SeqCst), marks, "marked from that callback only");
+        ((*plugin).on_main_thread.unwrap())(plugin);
+        assert_eq!(DIRTY_MARKS.load(Ordering::SeqCst), marks + 1);
+        ((*plugin).on_main_thread.unwrap())(plugin);
+        assert_eq!(DIRTY_MARKS.load(Ordering::SeqCst), marks + 1, "once per mark");
         ((*plugin).destroy.unwrap())(plugin);
         (entry().deinit.unwrap())();
     }

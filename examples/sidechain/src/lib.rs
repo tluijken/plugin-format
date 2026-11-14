@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use plugin_format::{Block, Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
+use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Shared, egui, export_clap, export_vst3};
 
 pub const POSITION: u32 = 0;
 
@@ -45,7 +45,7 @@ impl Shared for SidechainShared {
         bytes.is_empty()
     }
 
-    fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+    fn editor(&self, _: GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
         Box::new(|root| {
             egui::CentralPanel::default().show(root, |ui| {
                 ui.heading("Sidechain");

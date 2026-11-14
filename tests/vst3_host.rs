@@ -9,7 +9,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use gain::{FREQUENCY, GAIN};
+use gain::{FREQUENCY, GAIN, TEST_GESTURE};
 use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
 use vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
@@ -284,6 +284,55 @@ fn normalised(db: f64) -> f64 {
     (db + 60.0) / 84.0
 }
 
+#[derive(Debug, PartialEq)]
+enum Edit {
+    Begin(ParamID),
+    Perform(ParamID, ParamValue),
+    End(ParamID),
+    Restart(int32),
+}
+
+#[derive(Default)]
+struct Recorder(Mutex<Vec<Edit>>);
+
+impl Class for Recorder {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl Recorder {
+    fn record(&self, edit: Edit) -> tresult {
+        self.0.lock().unwrap().push(edit);
+        kResultOk
+    }
+
+    fn take(&self) -> Vec<Edit> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+impl IComponentHandlerTrait for Recorder {
+    unsafe fn beginEdit(&self, id: ParamID) -> tresult {
+        self.record(Edit::Begin(id))
+    }
+    unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> tresult {
+        self.record(Edit::Perform(id, value))
+    }
+    unsafe fn endEdit(&self, id: ParamID) -> tresult {
+        self.record(Edit::End(id))
+    }
+    unsafe fn restartComponent(&self, flags: int32) -> tresult {
+        self.record(Edit::Restart(flags))
+    }
+}
+
+/// An instance whose host records what it is told, and the recording.
+fn recorded() -> (Instance, ComWrapper<Recorder>) {
+    let plugin = create();
+    let recorder = ComWrapper::new(Recorder::default());
+    assert_eq!(unsafe { plugin.controller.setComponentHandler(recorder.to_com_ptr::<IComponentHandler>().unwrap().as_ptr()) }, kResultOk);
+    (plugin, recorder)
+}
+
 #[test]
 fn loads_and_scans_the_factory() {
     let _turn = turn();
@@ -310,7 +359,7 @@ fn loads_and_scans_the_factory() {
         let plugin = create();
         let mut controller_cid: TUID = [0; 16];
         assert_ne!(plugin.component.getControllerClassId(&mut controller_cid), kResultOk, "single component");
-        assert_eq!(plugin.controller.getParameterCount(), 2);
+        assert_eq!(plugin.controller.getParameterCount(), 3);
         let mut param: ParameterInfo = std::mem::zeroed();
         assert_eq!(plugin.controller.getParameterInfo(0, &mut param), kResultOk);
         assert_eq!((param.id, wide(&param.title)), (GAIN, "Gain".to_owned()));
@@ -522,5 +571,34 @@ fn the_view_takes_the_hosts_content_scale_and_reports_its_size_in_it() {
         assert_eq!(scaling.setContentScaleFactor(1.0), kResultTrue);
         assert_eq!(size(&editor), (200, 100));
         drop(plugin);
+    }
+}
+
+#[test]
+fn gesture_reaches_the_vst3_host() {
+    let _turn = turn();
+    unsafe {
+        let (plugin, recorder) = recorded();
+        let mut info: ParameterInfo = std::mem::zeroed();
+        assert_eq!(plugin.controller.getParameterInfo(2, &mut info), kResultOk);
+        assert_eq!((info.id, info.flags & kCanAutomate), (TEST_GESTURE, 0));
+
+        assert_eq!(plugin.controller.setParamNormalized(TEST_GESTURE, 1.0), kResultOk);
+        let edits: Vec<Edit> = recorder.take().into_iter().filter(|e| !matches!(e, Edit::Restart(_))).collect();
+        assert_eq!(edits, [Edit::Begin(GAIN), Edit::Perform(GAIN, normalised(-6.0)), Edit::End(GAIN)]);
+        assert!((plugin.controller.getParamNormalized(GAIN) - normalised(-6.0)).abs() < 1e-9);
+        plugin.component.terminate();
+    }
+}
+
+#[test]
+fn mark_dirty_reaches_the_host() {
+    let _turn = turn();
+    unsafe {
+        let (plugin, recorder) = recorded();
+        assert_eq!(plugin.controller.setParamNormalized(TEST_GESTURE, 1.0), kResultOk);
+        let restarts: Vec<Edit> = recorder.take().into_iter().filter(|e| matches!(e, Edit::Restart(_))).collect();
+        assert_eq!(restarts, [Edit::Restart(kParamValuesChanged)]);
+        plugin.component.terminate();
     }
 }

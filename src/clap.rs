@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 #[doc(hidden)]
@@ -10,13 +10,15 @@ pub use clap_sys as sys;
 
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{
-    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_IS_PLAYING, clap_event_param_value, clap_input_events, clap_output_events};
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_VALUE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_IS_PLAYING,
+    clap_event_header, clap_event_param_gesture, clap_event_param_value, clap_input_events, clap_output_events,
+};
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params};
-use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
@@ -27,7 +29,8 @@ use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
 use crate::editor::{self, Parent};
-use crate::{Extras, Kind, Plugin, Shared, copy_str, guard, process_block};
+use crate::gui_context::{Event, Wake};
+use crate::{Extras, GuiContext, Kind, Plugin, Shared, copy_str, guard, process_block};
 
 fn same(a: *const c_char, b: &CStr) -> bool {
     !a.is_null() && unsafe { CStr::from_ptr(a) } == b
@@ -130,6 +133,9 @@ struct Instance<P: Plugin> {
     /// inside `host_latency.changed()` while `activate` still holds the processor.
     latency: AtomicU32,
     host_latency: AtomicPtr<clap_host_latency>,
+    host_state: AtomicPtr<clap_host_state>,
+    /// Its events go out from `process` or `flush`, its dirty mark from `on_main_thread`.
+    cx: GuiContext,
     gui: Mutex<Gui>,
 }
 
@@ -137,6 +143,8 @@ impl<P: Plugin> Instance<P> {
     fn create(host: *const clap_host, desc: &'static clap_plugin_descriptor) -> *const clap_plugin {
         let (plugin, shared) = P::new();
         let latency = plugin.latency();
+        let weak: Weak<dyn Shared> = Arc::downgrade(&shared) as Weak<P::Shared>;
+        let cx = GuiContext::new(weak);
         let instance = Box::into_raw(Box::new(Instance {
             clap: clap_plugin {
                 desc,
@@ -160,6 +168,8 @@ impl<P: Plugin> Instance<P> {
             sample_rate: AtomicU64::new(0),
             latency: AtomicU32::new(latency),
             host_latency: AtomicPtr::new(ptr::null_mut()),
+            host_state: AtomicPtr::new(ptr::null_mut()),
+            cx,
             gui: Mutex::default(),
         }));
         unsafe {
@@ -191,6 +201,22 @@ impl<P: Plugin> Instance<P> {
         Self::with(plugin, || false, |instance| {
             let latency = unsafe { instance.host_extension(CLAP_EXT_LATENCY) } as *mut clap_host_latency;
             instance.host_latency.store(latency, Ordering::Release);
+            let state = unsafe { instance.host_extension(CLAP_EXT_STATE) } as *mut clap_host_state;
+            instance.host_state.store(state, Ordering::Release);
+            let params = unsafe { instance.host_extension(CLAP_EXT_PARAMS) } as *const clap_host_params;
+            // Both host calls are thread-safe; `destroy` disconnects before the host may go away.
+            let (host, request_flush) = (instance.host as usize, unsafe { params.as_ref() }.and_then(|p| p.request_flush));
+            let request_callback = unsafe { instance.host.as_ref() }.and_then(|h| h.request_callback).filter(|_| !state.is_null());
+            instance.cx.connect(Box::new(move |wake| {
+                let request = match wake {
+                    Wake::Events => request_flush,
+                    Wake::Dirty => request_callback,
+                };
+                if let Some(request) = request {
+                    unsafe { request(host as *const clap_host) };
+                }
+            }));
+            instance.shared.attach(instance.cx.clone());
             true
         })
     }
@@ -201,6 +227,7 @@ impl<P: Plugin> Instance<P> {
                 return;
             }
             let instance = Box::from_raw((*plugin).plugin_data as *mut Self);
+            instance.cx.disconnect();
             if instance.active.load(Ordering::Acquire) {
                 instance.plugin_mut().deactivate();
             }
@@ -243,7 +270,15 @@ impl<P: Plugin> Instance<P> {
 
     unsafe extern "C" fn reset(_: *const clap_plugin) {}
 
-    unsafe extern "C" fn on_main_thread(_: *const clap_plugin) {}
+    unsafe extern "C" fn on_main_thread(plugin: *const clap_plugin) {
+        Self::with(plugin, || (), |instance| {
+            if instance.cx.take_dirty()
+                && let Some(mark_dirty) = unsafe { instance.host_state.load(Ordering::Acquire).as_ref() }.and_then(|s| s.mark_dirty)
+            {
+                unsafe { mark_dirty(instance.host) };
+            }
+        })
+    }
 
     unsafe extern "C" fn process(plugin: *const clap_plugin, process: *const clap_process) -> clap_process_status {
         Self::with(plugin, || CLAP_PROCESS_ERROR, |instance| unsafe {
@@ -253,6 +288,7 @@ impl<P: Plugin> Instance<P> {
             let process = &*process;
             instance.apply(process.in_events);
             let status = instance.run(process);
+            instance.send(process.out_events);
             if instance.plugin_mut().take_latency_changed()
                 && let Some(host) = instance.host.as_ref()
                 && let Some(restart) = host.request_restart
@@ -448,8 +484,39 @@ impl<P: Plugin> Instance<P> {
         })
     }
 
-    unsafe extern "C" fn flush(plugin: *const clap_plugin, events: *const clap_input_events, _out: *const clap_output_events) {
-        Self::with(plugin, || (), |instance| instance.apply(events))
+    unsafe extern "C" fn flush(plugin: *const clap_plugin, events: *const clap_input_events, out: *const clap_output_events) {
+        Self::with(plugin, || (), |instance| {
+            instance.apply(events);
+            instance.send(out);
+        })
+    }
+
+    /// What the editor did, for as much as the host takes; the rest goes with the next call.
+    fn send(&self, out: *const clap_output_events) {
+        let Some(try_push) = (unsafe { out.as_ref() }).and_then(|o| o.try_push) else { return };
+        let header = |type_, size: usize| clap_event_header { size: size as u32, time: 0, space_id: CLAP_CORE_EVENT_SPACE_ID, type_, flags: 0 };
+        self.cx.drain(|event| unsafe {
+            match event {
+                Event::Begin(id) | Event::End(id) => {
+                    let type_ = if matches!(event, Event::Begin(_)) { CLAP_EVENT_PARAM_GESTURE_BEGIN } else { CLAP_EVENT_PARAM_GESTURE_END };
+                    let gesture = clap_event_param_gesture { header: header(type_, size_of::<clap_event_param_gesture>()), param_id: id };
+                    try_push(out, &gesture.header)
+                }
+                Event::Value(id, value) => {
+                    let change = clap_event_param_value {
+                        header: header(CLAP_EVENT_PARAM_VALUE, size_of::<clap_event_param_value>()),
+                        param_id: id,
+                        cookie: ptr::null_mut(),
+                        note_id: -1,
+                        port_index: -1,
+                        channel: -1,
+                        key: -1,
+                        value,
+                    };
+                    try_push(out, &change.header)
+                }
+            }
+        });
     }
 
     const STATE: clap_plugin_state = clap_plugin_state { save: Some(Self::save), load: Some(Self::load) };
@@ -708,7 +775,7 @@ impl<P: Plugin> Instance<P> {
             #[cfg(not(target_os = "windows"))]
             let parent = Parent::X11(unsafe { window.specific.x11 });
             gui.window = None;
-            gui.window = editor::open(parent, P::EDITOR_SIZE, gui.scale.clone(), instance.shared.editor(), Box::new(|| {}));
+            gui.window = editor::open(parent, P::EDITOR_SIZE, gui.scale.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
             gui.window.is_some()
         })
     }
@@ -787,7 +854,7 @@ mod tests {
         fn load(&self, _: &[u8]) -> bool {
             true
         }
-        fn editor(&self) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+        fn editor(&self, _: crate::GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
             Box::new(|_| {})
         }
     }
