@@ -2,6 +2,7 @@ use core::ffi::CStr;
 
 pub mod clap;
 mod param;
+pub mod vst3;
 
 pub use egui;
 pub use param::*;
@@ -58,4 +59,83 @@ macro_rules! export_clap {
         #[unsafe(no_mangle)]
         pub static clap_entry: $crate::clap::sys::entry::clap_plugin_entry = $crate::clap::entry::<$plugin>();
     };
+}
+
+/// Exports `$plugin` as the library's VST3 plugin through `GetPluginFactory` and the platform's module entry points.
+#[macro_export]
+macro_rules! export_vst3 {
+    ($plugin:ty) => {
+        #[unsafe(no_mangle)]
+        pub extern "system" fn GetPluginFactory() -> *mut ::core::ffi::c_void {
+            $crate::vst3::factory::<$plugin>()
+        }
+
+        #[cfg(target_os = "linux")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn ModuleEntry(_: *mut ::core::ffi::c_void) -> bool {
+            true
+        }
+
+        #[cfg(target_os = "linux")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn ModuleExit() -> bool {
+            true
+        }
+
+        #[cfg(target_os = "windows")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn InitDll() -> bool {
+            true
+        }
+
+        #[cfg(target_os = "windows")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn ExitDll() -> bool {
+            true
+        }
+    };
+}
+
+fn guard<R>(failed: R, body: impl FnOnce() -> R) -> R {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(failed)
+}
+
+/// Fills the output channels from the input and lets `plugin` process them in place: input channel
+/// `c` goes to output `c` when `c < configured`, a missing one becomes silence, and outputs from
+/// `configured` on are left to the plugin.
+///
+/// # Safety
+/// `outs` holds one or two distinct channels, each valid for `frames` writes. Every non-null `ins[c]`
+/// is valid for `frames` reads and is either the same memory as `outs[c]` or overlaps no output.
+unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f32], ins: &[*const f32], configured: usize) {
+    unsafe {
+        for (c, &out) in outs.iter().enumerate() {
+            let source = if c < configured { ins.get(c).copied().unwrap_or(std::ptr::null()) } else { std::ptr::null() };
+            if !source.is_null() {
+                if !std::ptr::eq(source, out) {
+                    std::ptr::copy(source, out, frames);
+                }
+            } else if c < configured {
+                std::ptr::write_bytes(out, 0, frames);
+            }
+        }
+        let mut channels: [&mut [f32]; 2] = [&mut [], &mut []];
+        for (channel, &out) in channels.iter_mut().zip(outs) {
+            *channel = std::slice::from_raw_parts_mut(out, frames);
+        }
+        plugin.process(&mut channels[..outs.len().min(2)]);
+    }
+}
+
+/// Writes `text` NUL-terminated into `out`, cut at a character boundary if it does not fit.
+fn copy_str(text: &str, out: &mut [core::ffi::c_char]) {
+    let Some(room) = out.len().checked_sub(1) else { return };
+    let mut len = text.len().min(room);
+    while !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    for (o, &b) in out.iter_mut().zip(&text.as_bytes()[..len]) {
+        *o = b as core::ffi::c_char;
+    }
+    out[len] = 0;
 }

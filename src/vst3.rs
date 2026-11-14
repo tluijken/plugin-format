@@ -1,0 +1,856 @@
+use std::cell::UnsafeCell;
+use std::ffi::{CStr, c_char, c_void};
+use std::marker::PhantomData;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
+use vst3::Steinberg::Vst::BusInfo_::BusFlags_::kDefaultActive;
+use vst3::Steinberg::Vst::BusTypes_::kMain;
+use vst3::Steinberg::Vst::MediaTypes_::kAudio;
+use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
+use vst3::Steinberg::Vst::RestartFlags_::{kLatencyChanged, kParamValuesChanged};
+use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
+use vst3::Steinberg::Vst::*;
+use vst3::Steinberg::*;
+use vst3::{Class, ComPtr, ComRef, ComWrapper};
+
+use crate::{Kind, ParamInfo, Plugin, Shared, copy_str, guard, process_block};
+
+const CATEGORY: &str = "Audio Module Class";
+
+fn copy_wide(text: &str, out: &mut [TChar]) {
+    let Some(room) = out.len().checked_sub(1) else { return };
+    let mut len = 0;
+    for (o, unit) in out.iter_mut().zip(text.encode_utf16()).take(room) {
+        *o = unit;
+        len += 1;
+    }
+    if len > 0 && (0xD800..0xDC00).contains(&out[len - 1]) {
+        len -= 1;
+    }
+    out[len] = 0;
+}
+
+/// Reads a NUL-terminated string the host hands over, giving up after 1024 units.
+unsafe fn read_wide(text: *const TChar) -> Option<String> {
+    let mut units = Vec::new();
+    for i in 0..1024 {
+        let unit = unsafe { *text.add(i) };
+        if unit == 0 {
+            return String::from_utf16(&units).ok();
+        }
+        units.push(unit);
+    }
+    None
+}
+
+fn class_id<P: Plugin>() -> TUID {
+    P::INFO.vst3_class_id.map(|b| b as c_char)
+}
+
+/// The library's `GetPluginFactory`: a new reference the host releases.
+pub fn factory<P: Plugin>() -> *mut c_void {
+    guard(ptr::null_mut(), || {
+        ComWrapper::new(Factory::<P>(PhantomData)).to_com_ptr::<IPluginFactory>().map_or(ptr::null_mut(), |f| f.into_raw() as *mut c_void)
+    })
+}
+
+struct Factory<P>(PhantomData<P>);
+
+impl<P: Plugin> Class for Factory<P> {
+    type Interfaces = (IPluginFactory3,);
+}
+
+impl<P: Plugin> IPluginFactoryTrait for Factory<P> {
+    unsafe fn getFactoryInfo(&self, info: *mut PFactoryInfo) -> tresult {
+        guard(kInternalError, || {
+            if info.is_null() {
+                return kInvalidArgument;
+            }
+            let mut out: PFactoryInfo = unsafe { std::mem::zeroed() };
+            copy_str(P::INFO.vendor, &mut out.vendor);
+            out.flags = PFactoryInfo_::FactoryFlags_::kUnicode as int32;
+            unsafe { info.write(out) };
+            kResultOk
+        })
+    }
+
+    unsafe fn countClasses(&self) -> int32 {
+        1
+    }
+
+    unsafe fn getClassInfo(&self, index: int32, info: *mut PClassInfo) -> tresult {
+        guard(kInternalError, || {
+            if index != 0 || info.is_null() {
+                return kInvalidArgument;
+            }
+            let mut out: PClassInfo = unsafe { std::mem::zeroed() };
+            out.cid = class_id::<P>();
+            out.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as int32;
+            copy_str(CATEGORY, &mut out.category);
+            copy_str(P::INFO.name, &mut out.name);
+            unsafe { info.write(out) };
+            kResultOk
+        })
+    }
+
+    unsafe fn createInstance(&self, cid: FIDString, iid: FIDString, obj: *mut *mut c_void) -> tresult {
+        guard(kInternalError, || unsafe {
+            if obj.is_null() {
+                return kInvalidArgument;
+            }
+            obj.write(ptr::null_mut());
+            if cid.is_null() || iid.is_null() {
+                return kInvalidArgument;
+            }
+            if ptr::read_unaligned(cid as *const TUID) != class_id::<P>() {
+                return kNoInterface;
+            }
+            let instance = ComWrapper::new(Component::<P>::new());
+            let Some(unknown) = instance.to_com_ptr::<FUnknown>() else { return kNoInterface };
+            let unknown = unknown.as_ptr();
+            ((*(*unknown).vtbl).queryInterface)(unknown, iid as *const TUID, obj)
+        })
+    }
+}
+
+impl<P: Plugin> IPluginFactory2Trait for Factory<P> {
+    unsafe fn getClassInfo2(&self, index: int32, info: *mut PClassInfo2) -> tresult {
+        guard(kInternalError, || {
+            if index != 0 || info.is_null() {
+                return kInvalidArgument;
+            }
+            let mut out: PClassInfo2 = unsafe { std::mem::zeroed() };
+            out.cid = class_id::<P>();
+            out.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as int32;
+            copy_str(CATEGORY, &mut out.category);
+            copy_str(P::INFO.name, &mut out.name);
+            copy_str(P::INFO.vst3_subcategories, &mut out.subCategories);
+            copy_str(P::INFO.vendor, &mut out.vendor);
+            copy_str(P::INFO.version, &mut out.version);
+            copy_str(sdk_version(), &mut out.sdkVersion);
+            unsafe { info.write(out) };
+            kResultOk
+        })
+    }
+}
+
+impl<P: Plugin> IPluginFactory3Trait for Factory<P> {
+    unsafe fn getClassInfoUnicode(&self, index: int32, info: *mut PClassInfoW) -> tresult {
+        guard(kInternalError, || {
+            if index != 0 || info.is_null() {
+                return kInvalidArgument;
+            }
+            let mut out: PClassInfoW = unsafe { std::mem::zeroed() };
+            out.cid = class_id::<P>();
+            out.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as int32;
+            copy_str(CATEGORY, &mut out.category);
+            copy_wide(P::INFO.name, &mut out.name);
+            copy_str(P::INFO.vst3_subcategories, &mut out.subCategories);
+            copy_wide(P::INFO.vendor, &mut out.vendor);
+            copy_wide(P::INFO.version, &mut out.version);
+            copy_wide(sdk_version(), &mut out.sdkVersion);
+            unsafe { info.write(out) };
+            kResultOk
+        })
+    }
+
+    unsafe fn setHostContext(&self, _context: *mut FUnknown) -> tresult {
+        kResultOk
+    }
+}
+
+fn sdk_version() -> &'static str {
+    unsafe { CStr::from_ptr(SDKVersionString) }.to_str().unwrap_or_default()
+}
+
+/// One object is component, processor and controller, as in the SDK's single-component effects.
+///
+/// `plugin` is reached only through `claim`, which hands it to one caller at a time: the main thread
+/// in `setActive`, the audio thread in `process`, and the last release. VST3 never runs `setActive`
+/// alongside `process`; should a host do so anyway, the loser of the claim skips its work rather
+/// than alias the processor. Everything else goes through `shared` and atomics.
+struct Component<P: Plugin> {
+    plugin: UnsafeCell<P>,
+    claimed: AtomicBool,
+    shared: Arc<P::Shared>,
+    /// Changed only while `plugin` is claimed, so a claimant sees it consistent with `plugin`.
+    active: AtomicBool,
+    inputs: AtomicU32,
+    sample_rate: AtomicU64,
+    /// 0 until `setupProcessing`.
+    max_block: AtomicU32,
+    /// What `getLatencySamples` reports. It never reads `plugin`, so a host may ask at any time.
+    latency: AtomicU32,
+    /// Left by `process` for the next main-thread call to announce, since `process` may not call the host's handler.
+    new_latency: AtomicU32,
+    latency_changed: AtomicBool,
+    handler: Mutex<Option<ComPtr<IComponentHandler>>>,
+}
+
+impl<P: Plugin> Class for Component<P> {
+    type Interfaces = (IComponent, IAudioProcessor, IEditController, IProcessContextRequirements);
+}
+
+impl<P: Plugin> Drop for Component<P> {
+    fn drop(&mut self) {
+        guard((), || {
+            if *self.active.get_mut() {
+                self.plugin.get_mut().deactivate();
+            }
+        })
+    }
+}
+
+impl<P: Plugin> Component<P> {
+    fn new() -> Self {
+        let (plugin, shared) = P::new();
+        let latency = plugin.latency();
+        Component {
+            plugin: UnsafeCell::new(plugin),
+            claimed: AtomicBool::new(false),
+            shared,
+            active: AtomicBool::new(false),
+            inputs: AtomicU32::new(1),
+            sample_rate: AtomicU64::new(0),
+            max_block: AtomicU32::new(0),
+            latency: AtomicU32::new(latency),
+            new_latency: AtomicU32::new(latency),
+            latency_changed: AtomicBool::new(false),
+            handler: Mutex::new(None),
+        }
+    }
+
+    /// `None` when another thread holds the processor.
+    fn claim<R>(&self, body: impl FnOnce(&mut P) -> R) -> Option<R> {
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.claimed.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).ok()?;
+        let _release = Release(&self.claimed);
+        Some(body(unsafe { &mut *self.plugin.get() }))
+    }
+
+    fn info(&self, id: ParamID) -> Option<&'static ParamInfo> {
+        self.shared.params().iter().find(|p| p.id == id)
+    }
+
+    fn restart(&self, flags: RestartFlags) {
+        let handler = self.handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(handler) = handler {
+            unsafe { handler.restartComponent(flags) };
+        }
+    }
+
+    fn announce_latency(&self) {
+        if self.latency_changed.swap(false, Ordering::AcqRel) {
+            self.latency.store(self.new_latency.load(Ordering::Acquire), Ordering::Release);
+            self.restart(kLatencyChanged);
+        }
+    }
+
+    fn set_active(&self, active: bool) -> tresult {
+        if active == self.active.load(Ordering::Acquire) {
+            return kResultOk;
+        }
+        if active {
+            let max_block = self.max_block.load(Ordering::Acquire) as usize;
+            if max_block == 0 {
+                return kResultFalse;
+            }
+            let sample_rate = f64::from_bits(self.sample_rate.load(Ordering::Acquire));
+            let inputs = self.inputs.load(Ordering::Acquire) as usize;
+            let Some(latency) = self.claim(|plugin| {
+                let latency = plugin.activate(sample_rate, max_block, inputs);
+                self.active.store(true, Ordering::Release);
+                latency
+            }) else {
+                return kResultFalse;
+            };
+            if self.latency.swap(latency, Ordering::AcqRel) != latency {
+                self.restart(kLatencyChanged);
+            }
+        } else {
+            let deactivated = self.claim(|plugin| {
+                plugin.deactivate();
+                self.active.store(false, Ordering::Release);
+            });
+            if deactivated.is_none() {
+                return kResultFalse;
+            }
+            self.announce_latency();
+        }
+        kResultOk
+    }
+
+    fn apply(&self, changes: *mut IParameterChanges) {
+        unsafe {
+            let Some(changes) = ComRef::from_raw(changes) else { return };
+            for i in 0..changes.getParameterCount() {
+                let Some(queue) = ComRef::from_raw(changes.getParameterData(i)) else { continue };
+                let id = queue.getParameterId();
+                let points = queue.getPointCount();
+                let Some(info) = self.info(id) else { continue };
+                let (mut offset, mut value) = (0, 0.0);
+                if points > 0 && queue.getPoint(points - 1, &mut offset, &mut value) == kResultOk {
+                    self.shared.set_param(id, info.plain(value));
+                }
+            }
+        }
+    }
+
+    unsafe fn run(&self, data: &ProcessData) -> tresult {
+        unsafe {
+            if data.numSamples <= 0 {
+                return kResultOk;
+            }
+            if data.symbolicSampleSize != kSample32 as int32 {
+                return kInvalidArgument;
+            }
+            let frames = data.numSamples as usize;
+            if data.numOutputs < 1 || data.outputs.is_null() {
+                return kResultOk;
+            }
+            let output = data.outputs;
+            let count = ((*output).numChannels.max(0) as usize).min(2);
+            if count == 0 {
+                return kResultOk;
+            }
+            let buffers = (*output).__field0.channelBuffers32;
+            if buffers.is_null() {
+                return kInvalidArgument;
+            }
+            let mut outs = [ptr::null_mut::<f32>(); 2];
+            for (c, out) in outs.iter_mut().enumerate().take(count) {
+                *out = *buffers.add(c);
+                if out.is_null() {
+                    return kInvalidArgument;
+                }
+            }
+            if count == 2 && outs[0] == outs[1] {
+                return kInvalidArgument;
+            }
+            (*output).silenceFlags = 0;
+
+            let mut ins = [ptr::null::<f32>(); 2];
+            let mut inputs = 0;
+            if data.numInputs > 0 && !data.inputs.is_null() && !(*data.inputs).__field0.channelBuffers32.is_null() {
+                let input = data.inputs;
+                inputs = ((*input).numChannels.max(0) as usize).min(2);
+                for (c, source) in ins.iter_mut().enumerate().take(inputs) {
+                    *source = *(*input).__field0.channelBuffers32.add(c);
+                }
+            }
+            let configured = self.inputs.load(Ordering::Acquire) as usize;
+            let played = self.claim(|plugin| {
+                if !self.active.load(Ordering::Acquire) {
+                    return kResultFalse;
+                }
+                process_block(plugin, frames, &outs[..count], &ins[..inputs], configured);
+                if plugin.take_latency_changed() {
+                    self.new_latency.store(plugin.latency(), Ordering::Release);
+                    self.latency_changed.store(true, Ordering::Release);
+                }
+                kResultOk
+            });
+            played.unwrap_or(kResultFalse)
+        }
+    }
+
+    fn save_state(&self, state: *mut IBStream) -> tresult {
+        self.announce_latency();
+        unsafe {
+            let Some(stream) = ComRef::from_raw(state) else { return kInvalidArgument };
+            let bytes = self.shared.save();
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                let mut written = 0;
+                let size = rest.len().min(int32::MAX as usize) as int32;
+                if stream.write(rest.as_ptr() as *mut c_void, size, &mut written) != kResultOk || written <= 0 {
+                    return kResultFalse;
+                }
+                rest = &rest[(written as usize).min(rest.len())..];
+            }
+            kResultOk
+        }
+    }
+
+    fn load_state(&self, state: *mut IBStream) -> tresult {
+        unsafe {
+            let Some(stream) = ComRef::from_raw(state) else { return kInvalidArgument };
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let mut got = 0;
+                let result = stream.read(chunk.as_mut_ptr() as *mut c_void, chunk.len() as int32, &mut got);
+                let got = (got.max(0) as usize).min(chunk.len());
+                bytes.extend_from_slice(&chunk[..got]);
+                if result != kResultOk || got == 0 {
+                    break;
+                }
+            }
+            if !self.shared.load(&bytes) {
+                return kResultFalse;
+            }
+        }
+        self.restart(kParamValuesChanged);
+        kResultOk
+    }
+}
+
+impl<P: Plugin> IPluginBaseTrait for Component<P> {
+    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn terminate(&self) -> tresult {
+        guard(kInternalError, || {
+            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            kResultOk
+        })
+    }
+}
+
+impl<P: Plugin> IComponentTrait for Component<P> {
+    /// No separate controller: the host finds `IEditController` on this object.
+    unsafe fn getControllerClassId(&self, _class_id: *mut TUID) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn setIoMode(&self, _mode: IoMode) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn getBusCount(&self, media: MediaType, dir: BusDirection) -> int32 {
+        (media == kAudio as MediaType && (dir == kInput as BusDirection || dir == kOutput as BusDirection)) as int32
+    }
+
+    unsafe fn getBusInfo(&self, media: MediaType, dir: BusDirection, index: int32, bus: *mut BusInfo) -> tresult {
+        guard(kInternalError, || {
+            if media != kAudio as MediaType || index != 0 || bus.is_null() {
+                return kInvalidArgument;
+            }
+            let (channels, name) = match dir {
+                d if d == kInput as BusDirection => (self.inputs.load(Ordering::Acquire) as int32, "Input"),
+                d if d == kOutput as BusDirection => (2, "Output"),
+                _ => return kInvalidArgument,
+            };
+            let mut info: BusInfo = unsafe { std::mem::zeroed() };
+            info.mediaType = media;
+            info.direction = dir;
+            info.channelCount = channels;
+            copy_wide(name, &mut info.name);
+            info.busType = kMain as BusType;
+            info.flags = kDefaultActive as uint32;
+            unsafe { bus.write(info) };
+            kResultOk
+        })
+    }
+
+    unsafe fn getRoutingInfo(&self, _in_info: *mut RoutingInfo, _out_info: *mut RoutingInfo) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn activateBus(&self, media: MediaType, _dir: BusDirection, index: int32, _state: TBool) -> tresult {
+        if media == kAudio as MediaType && index == 0 { kResultOk } else { kInvalidArgument }
+    }
+
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        guard(kInternalError, || self.set_active(state != 0))
+    }
+
+    unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        guard(kInternalError, || self.load_state(state))
+    }
+
+    unsafe fn getState(&self, state: *mut IBStream) -> tresult {
+        guard(kInternalError, || self.save_state(state))
+    }
+}
+
+impl<P: Plugin> IAudioProcessorTrait for Component<P> {
+    unsafe fn setBusArrangements(&self, inputs: *mut SpeakerArrangement, num_ins: int32, outputs: *mut SpeakerArrangement, num_outs: int32) -> tresult {
+        guard(kInternalError, || unsafe {
+            if num_ins != 1 || num_outs != 1 || inputs.is_null() || outputs.is_null() || *outputs != SpeakerArr::kStereo {
+                return kResultFalse;
+            }
+            let channels = match *inputs {
+                SpeakerArr::kMono => 1,
+                SpeakerArr::kStereo => 2,
+                _ => return kResultFalse,
+            };
+            if self.active.load(Ordering::Acquire) {
+                return kResultFalse;
+            }
+            self.inputs.store(channels, Ordering::Release);
+            kResultTrue
+        })
+    }
+
+    unsafe fn getBusArrangement(&self, dir: BusDirection, index: int32, arr: *mut SpeakerArrangement) -> tresult {
+        guard(kInternalError, || {
+            if index != 0 || arr.is_null() {
+                return kInvalidArgument;
+            }
+            let arrangement = match dir {
+                d if d == kInput as BusDirection && self.inputs.load(Ordering::Acquire) == 1 => SpeakerArr::kMono,
+                d if d == kInput as BusDirection || d == kOutput as BusDirection => SpeakerArr::kStereo,
+                _ => return kInvalidArgument,
+            };
+            unsafe { arr.write(arrangement) };
+            kResultOk
+        })
+    }
+
+    unsafe fn canProcessSampleSize(&self, size: int32) -> tresult {
+        if size == kSample32 as int32 { kResultTrue } else { kResultFalse }
+    }
+
+    unsafe fn getLatencySamples(&self) -> uint32 {
+        self.latency.load(Ordering::Acquire)
+    }
+
+    unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        guard(kInternalError, || {
+            let Some(setup) = (unsafe { setup.as_ref() }) else { return kInvalidArgument };
+            if setup.symbolicSampleSize != kSample32 as int32 || self.active.load(Ordering::Acquire) {
+                return kResultFalse;
+            }
+            if !(setup.sampleRate.is_finite() && setup.sampleRate > 0.0) || setup.maxSamplesPerBlock <= 0 {
+                return kInvalidArgument;
+            }
+            self.sample_rate.store(setup.sampleRate.to_bits(), Ordering::Release);
+            self.max_block.store(setup.maxSamplesPerBlock as u32, Ordering::Release);
+            kResultOk
+        })
+    }
+
+    unsafe fn setProcessing(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        guard(kInternalError, || unsafe {
+            let Some(data) = data.as_ref() else { return kInvalidArgument };
+            self.apply(data.inputParameterChanges);
+            self.run(data)
+        })
+    }
+
+    unsafe fn getTailSamples(&self) -> uint32 {
+        0
+    }
+}
+
+impl<P: Plugin> IProcessContextRequirementsTrait for Component<P> {
+    unsafe fn getProcessContextRequirements(&self) -> uint32 {
+        0
+    }
+}
+
+impl<P: Plugin> IEditControllerTrait for Component<P> {
+    /// The component's own `setState` already loaded it.
+    unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn getParameterCount(&self) -> int32 {
+        guard(0, || self.shared.params().len() as int32)
+    }
+
+    unsafe fn getParameterInfo(&self, index: int32, info: *mut ParameterInfo) -> tresult {
+        guard(kInternalError, || {
+            let Some(param) = usize::try_from(index).ok().and_then(|i| self.shared.params().get(i)) else { return kInvalidArgument };
+            if info.is_null() {
+                return kInvalidArgument;
+            }
+            let mut out: ParameterInfo = unsafe { std::mem::zeroed() };
+            out.id = param.id;
+            copy_wide(param.name, &mut out.title);
+            copy_wide(param.name, &mut out.shortTitle);
+            out.stepCount = param.step_count();
+            out.defaultNormalizedValue = param.normalise(param.default);
+            out.unitId = kRootUnitId;
+            if param.automatable {
+                out.flags |= kCanAutomate;
+            }
+            if matches!(param.kind, Kind::List { .. }) {
+                out.flags |= kIsList;
+            }
+            unsafe { info.write(out) };
+            kResultOk
+        })
+    }
+
+    unsafe fn getParamStringByValue(&self, id: ParamID, value: ParamValue, string: *mut String128) -> tresult {
+        guard(kInternalError, || {
+            let Some(info) = self.info(id) else { return kInvalidArgument };
+            let Some(string) = (unsafe { string.as_mut() }) else { return kInvalidArgument };
+            copy_wide(&self.shared.param_text(id, info.plain(value)), string);
+            kResultOk
+        })
+    }
+
+    unsafe fn getParamValueByString(&self, id: ParamID, string: *mut TChar, value: *mut ParamValue) -> tresult {
+        guard(kInternalError, || {
+            let Some(info) = self.info(id) else { return kInvalidArgument };
+            if string.is_null() || value.is_null() {
+                return kInvalidArgument;
+            }
+            let Some(text) = (unsafe { read_wide(string) }) else { return kInvalidArgument };
+            let Some(plain) = self.shared.param_from_text(id, &text) else { return kResultFalse };
+            unsafe { value.write(info.normalise(plain)) };
+            kResultOk
+        })
+    }
+
+    unsafe fn normalizedParamToPlain(&self, id: ParamID, value: ParamValue) -> ParamValue {
+        guard(0.0, || self.info(id).map_or(0.0, |info| info.plain(value)))
+    }
+
+    unsafe fn plainParamToNormalized(&self, id: ParamID, plain: ParamValue) -> ParamValue {
+        guard(0.0, || self.info(id).map_or(0.0, |info| info.normalise(plain)))
+    }
+
+    unsafe fn getParamNormalized(&self, id: ParamID) -> ParamValue {
+        guard(0.0, || self.info(id).map_or(0.0, |info| info.normalise(self.shared.param(id))))
+    }
+
+    unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
+        guard(kInternalError, || {
+            let Some(info) = self.info(id) else { return kInvalidArgument };
+            self.shared.set_param(id, info.plain(value));
+            kResultOk
+        })
+    }
+
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        guard(kInternalError, || {
+            let handler = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr());
+            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = handler;
+            kResultOk
+        })
+    }
+
+    unsafe fn createView(&self, _name: FIDString) -> *mut IPlugView {
+        ptr::null_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicI32;
+
+    use vst3::Interface;
+
+    use super::*;
+    use crate::{Info, Shared};
+
+    struct Fixed;
+
+    impl Shared for Fixed {
+        fn params(&self) -> &'static [ParamInfo] {
+            &[]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {}
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send> {
+            Box::new(|_| {})
+        }
+    }
+
+    /// Doubles channel 0; activation `n` reports `latencies[n]`, and every block moves the latency to 7.
+    struct Doubler {
+        latencies: &'static [u32],
+        activations: usize,
+        latency: u32,
+        changed: bool,
+    }
+
+    impl Plugin for Doubler {
+        const INFO: Info = Info {
+            name: "Doubler",
+            vendor: "test",
+            version: "0",
+            clap_id: "test.doubler",
+            description: "",
+            clap_features: &[],
+            vst3_class_id: *b"testDoublerClass",
+            vst3_subcategories: "Fx",
+        };
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        type Shared = Fixed;
+        fn new() -> (Self, Arc<Fixed>) {
+            (Doubler { latencies: &[5, 5, 9], activations: 0, latency: 0, changed: false }, Arc::new(Fixed))
+        }
+        fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
+            self.latency = self.latencies[self.activations.min(self.latencies.len() - 1)];
+            self.activations += 1;
+            self.latency
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            self.latency
+        }
+        fn process(&mut self, channels: &mut [&mut [f32]]) {
+            for s in channels[0].iter_mut() {
+                *s *= 2.0;
+            }
+            self.latency = 7;
+            self.changed = true;
+        }
+        fn take_latency_changed(&mut self) -> bool {
+            std::mem::take(&mut self.changed)
+        }
+    }
+
+    struct Handler(Arc<AtomicI32>);
+
+    impl Class for Handler {
+        type Interfaces = (IComponentHandler,);
+    }
+
+    impl IComponentHandlerTrait for Handler {
+        unsafe fn beginEdit(&self, _: ParamID) -> tresult {
+            kResultOk
+        }
+        unsafe fn performEdit(&self, _: ParamID, _: ParamValue) -> tresult {
+            kResultOk
+        }
+        unsafe fn endEdit(&self, _: ParamID) -> tresult {
+            kResultOk
+        }
+        unsafe fn restartComponent(&self, flags: int32) -> tresult {
+            assert_eq!(flags, kLatencyChanged);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            kResultOk
+        }
+    }
+
+    fn create() -> (ComPtr<IComponent>, ComPtr<IAudioProcessor>, Arc<AtomicI32>) {
+        unsafe {
+            let factory = ComPtr::from_raw(factory::<Doubler>() as *mut IPluginFactory).unwrap();
+            let mut obj = ptr::null_mut();
+            let cid = class_id::<Doubler>();
+            assert_eq!(factory.createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj), kResultOk);
+            let component = ComPtr::from_raw(obj as *mut IComponent).unwrap();
+            let processor = component.cast::<IAudioProcessor>().unwrap();
+            let controller = component.cast::<IEditController>().unwrap();
+            let restarts = Arc::new(AtomicI32::new(0));
+            let handler = ComWrapper::new(Handler(restarts.clone())).to_com_ptr::<IComponentHandler>().unwrap();
+            assert_eq!(controller.setComponentHandler(handler.as_ptr()), kResultOk);
+            (component, processor, restarts)
+        }
+    }
+
+    fn setup(processor: &ComPtr<IAudioProcessor>) {
+        let mut setup = ProcessSetup { processMode: 0, symbolicSampleSize: kSample32 as int32, maxSamplesPerBlock: 16, sampleRate: 48_000.0 };
+        assert_eq!(unsafe { processor.setupProcessing(&mut setup) }, kResultOk);
+    }
+
+    /// One block with mono input in place on output 0.
+    unsafe fn play(processor: &ComPtr<IAudioProcessor>, left: &mut [f32], right: &mut [f32]) -> tresult {
+        unsafe {
+            let mut in_ptrs = [left.as_mut_ptr()];
+            let mut out_ptrs = [left.as_mut_ptr(), right.as_mut_ptr()];
+            let mut input = AudioBusBuffers { numChannels: 1, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: in_ptrs.as_mut_ptr() } };
+            let mut output = AudioBusBuffers { numChannels: 2, silenceFlags: 1, __field0: AudioBusBuffers__type0 { channelBuffers32: out_ptrs.as_mut_ptr() } };
+            let mut data = ProcessData {
+                processMode: 0,
+                symbolicSampleSize: kSample32 as int32,
+                numSamples: left.len() as int32,
+                numInputs: 1,
+                numOutputs: 1,
+                inputs: &mut input,
+                outputs: &mut output,
+                inputParameterChanges: ptr::null_mut(),
+                outputParameterChanges: ptr::null_mut(),
+                inputEvents: ptr::null_mut(),
+                outputEvents: ptr::null_mut(),
+                processContext: ptr::null_mut(),
+            };
+            processor.process(&mut data)
+        }
+    }
+
+    #[test]
+    fn in_place_mono_is_processed_once_and_latency_changes_are_announced_from_the_main_thread() {
+        unsafe {
+            let (component, processor, restarts) = create();
+            let mut left = vec![0.5f32; 16];
+            let mut right = vec![9.0f32; 16];
+            assert_ne!(component.setActive(1), kResultOk, "not set up");
+            setup(&processor);
+            assert_ne!(play(&processor, &mut left, &mut right), kResultOk, "not active");
+            assert_eq!(left[0], 0.5);
+
+            assert_eq!(component.setActive(1), kResultOk);
+            assert_eq!(processor.getLatencySamples(), 5);
+            assert_eq!(restarts.load(Ordering::SeqCst), 1, "activation moved the latency from 0 to 5");
+
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            assert!(left.iter().all(|&s| s == 1.0), "{left:?}");
+            assert!(right.iter().all(|&s| s == 9.0), "{right:?}");
+            assert_eq!(processor.getLatencySamples(), 5, "process leaves the announcement to the main thread");
+            assert_eq!(restarts.load(Ordering::SeqCst), 1);
+
+            assert_eq!(component.getState(ptr::null_mut()), kInvalidArgument);
+            assert_eq!(restarts.load(Ordering::SeqCst), 2);
+            assert_eq!(processor.getLatencySamples(), 7);
+
+            assert_eq!(play(&processor, &mut left, &mut right), kResultOk);
+            assert_eq!(component.setActive(0), kResultOk);
+            assert_eq!(restarts.load(Ordering::SeqCst), 3, "deactivation announces the change from the last block");
+            assert_eq!(component.setActive(0), kResultOk);
+            assert_eq!(restarts.load(Ordering::SeqCst), 3);
+
+            assert_eq!(component.setActive(1), kResultOk);
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (5, 4));
+            assert_eq!(component.setActive(0), kResultOk);
+            assert_eq!(component.setActive(1), kResultOk);
+            assert_eq!((processor.getLatencySamples(), restarts.load(Ordering::SeqCst)), (9, 5));
+        }
+    }
+
+    #[test]
+    fn a_host_cannot_change_buses_or_setup_while_active() {
+        unsafe {
+            let (component, processor, _) = create();
+            setup(&processor);
+            assert_eq!(component.setActive(1), kResultOk);
+            let (mut stereo, mut out) = (SpeakerArr::kStereo, SpeakerArr::kStereo);
+            assert_eq!(processor.setBusArrangements(&mut stereo, 1, &mut out, 1), kResultFalse);
+            let mut setup = ProcessSetup { processMode: 0, symbolicSampleSize: kSample32 as int32, maxSamplesPerBlock: 32, sampleRate: 44_100.0 };
+            assert_eq!(processor.setupProcessing(&mut setup), kResultFalse);
+            assert_eq!(processor.process(ptr::null_mut()), kInvalidArgument);
+            assert_eq!(processor.setBusArrangements(ptr::null_mut(), 1, ptr::null_mut(), 1), kResultFalse);
+        }
+    }
+}

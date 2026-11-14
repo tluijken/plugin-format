@@ -24,27 +24,10 @@ use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_ERROR, clap_process,
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
-use crate::{Plugin, Shared};
-
-fn guard<R>(failed: R, body: impl FnOnce() -> R) -> R {
-    catch_unwind(AssertUnwindSafe(body)).unwrap_or(failed)
-}
+use crate::{Plugin, Shared, copy_str, guard, process_block};
 
 fn same(a: *const c_char, b: &CStr) -> bool {
     !a.is_null() && unsafe { CStr::from_ptr(a) } == b
-}
-
-/// Writes `text` NUL-terminated into `out`, cut at a character boundary if it does not fit.
-fn copy_str(text: &str, out: &mut [c_char]) {
-    let Some(room) = out.len().checked_sub(1) else { return };
-    let mut len = text.len().min(room);
-    while !text.is_char_boundary(len) {
-        len -= 1;
-    }
-    for (o, &b) in out.iter_mut().zip(&text.as_bytes()[..len]) {
-        *o = b as c_char;
-    }
-    out[len] = 0;
 }
 
 struct Descriptor {
@@ -295,33 +278,17 @@ impl<P: Plugin> Instance<P> {
                 return CLAP_PROCESS_ERROR;
             }
 
-            let input = (process.audio_inputs_count > 0 && !process.audio_inputs.is_null()).then(|| &*process.audio_inputs);
-            let configured = self.inputs.load(Ordering::Relaxed) as usize;
-            let inputs = match input {
-                Some(input) if !input.data32.is_null() => (input.channel_count as usize).min(configured),
-                _ => 0,
-            };
-            for (c, &out) in outs.iter().enumerate().take(count) {
-                let source = match input {
-                    Some(input) if c < inputs => *input.data32.add(c),
-                    _ => ptr::null_mut(),
-                };
-                if !source.is_null() {
-                    if source != out {
-                        ptr::copy(source, out, frames);
-                    }
-                } else if c < configured {
-                    ptr::write_bytes(out, 0, frames);
+            let mut ins = [ptr::null::<f32>(); 2];
+            let mut inputs = 0;
+            if process.audio_inputs_count > 0 && !process.audio_inputs.is_null() && !(*process.audio_inputs).data32.is_null() {
+                let input = &*process.audio_inputs;
+                inputs = (input.channel_count as usize).min(2);
+                for (c, source) in ins.iter_mut().enumerate().take(inputs) {
+                    *source = *input.data32.add(c);
                 }
             }
-
-            let [left, right] = outs;
-            let mut channels: [&mut [f32]; 2] = [&mut [], &mut []];
-            channels[0] = std::slice::from_raw_parts_mut(left, frames);
-            if count == 2 {
-                channels[1] = std::slice::from_raw_parts_mut(right, frames);
-            }
-            self.plugin_mut().process(&mut channels[..count]);
+            let configured = self.inputs.load(Ordering::Relaxed) as usize;
+            process_block(self.plugin_mut(), frames, &outs[..count], &ins[..inputs], configured);
             CLAP_PROCESS_CONTINUE
         }
     }

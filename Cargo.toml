@@ -7,3 +7,4 @@ publish.workspace = true
 [dependencies]
 clap-sys = "0.5"
 egui = "0.37"
+vst3 = "0.3"
