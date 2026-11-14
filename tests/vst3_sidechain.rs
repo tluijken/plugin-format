@@ -215,3 +215,40 @@ fn zero_frame_block_is_harmless() {
         plugin.stop();
     }
 }
+
+#[test]
+fn a_sidechain_sharing_the_output_buffer_is_treated_as_absent() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        plugin.start(true);
+        let mut main_in = [vec![0.25f32; 128], vec![0.25f32; 128]];
+        let mut shared = [vec![0.5f32; 128], vec![0.5f32; 128]];
+        let mut main_ptrs = [main_in[0].as_mut_ptr(), main_in[1].as_mut_ptr()];
+        let mut shared_ptrs = [shared[0].as_mut_ptr(), shared[1].as_mut_ptr()];
+        let bus = |pointers: &mut [*mut f32; 2]| AudioBusBuffers {
+            numChannels: 2,
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 { channelBuffers32: pointers.as_mut_ptr() },
+        };
+        let mut inputs = [bus(&mut main_ptrs), bus(&mut shared_ptrs)];
+        let mut output = bus(&mut shared_ptrs);
+        let mut data = ProcessData {
+            processMode: 0,
+            symbolicSampleSize: kSample32 as i32,
+            numSamples: 128,
+            numInputs: 2,
+            numOutputs: 1,
+            inputs: inputs.as_mut_ptr(),
+            outputs: &mut output,
+            inputParameterChanges: ptr::null_mut(),
+            outputParameterChanges: ptr::null_mut(),
+            inputEvents: ptr::null_mut(),
+            outputEvents: ptr::null_mut(),
+            processContext: ptr::null_mut(),
+        };
+        assert_eq!(plugin.processor.process(&mut data), kResultOk);
+        assert!(shared[0].iter().all(|&s| s == 0.25), "{:?}", &shared[0][..4]);
+        plugin.stop();
+    }
+}

@@ -566,7 +566,7 @@ impl<P: Plugin> Instance<P> {
             let mut config = clap_audio_ports_config {
                 id: index,
                 name: [0; _],
-                input_port_count: 1,
+                input_port_count: 1 + P::INFO.sidechain as u32,
                 output_port_count: 1,
                 has_main_input: true,
                 main_input_channel_count: inputs,

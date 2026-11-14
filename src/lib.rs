@@ -129,7 +129,7 @@ struct Extras {
 /// # Safety
 /// `outs` holds one or two distinct channels, each valid for `frames` writes. Every non-null `ins[c]`
 /// is valid for `frames` reads and is either the same memory as `outs[c]` or overlaps no output.
-/// A `sidechain` is valid for `frames` reads and overlaps no output.
+/// A `sidechain` is valid for `frames` reads; one that overlaps an output is dropped.
 unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f32], ins: &[*const f32], configured: usize, extras: Extras) {
     unsafe {
         for (c, &out) in outs.iter().enumerate() {
@@ -142,11 +142,15 @@ unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f
                 std::ptr::write_bytes(out, 0, frames);
             }
         }
+        let apart = |side: *const f32| outs.iter().all(|&out| (side as usize).abs_diff(out as usize) >= frames * size_of::<f32>());
+        let sidechain = extras
+            .sidechain
+            .filter(|side| side.iter().all(|&s| apart(s)))
+            .map(|[left, right]| [std::slice::from_raw_parts(left, frames), std::slice::from_raw_parts(right, frames)]);
         let mut channels: [&mut [f32]; 2] = [&mut [], &mut []];
         for (channel, &out) in channels.iter_mut().zip(outs) {
             *channel = std::slice::from_raw_parts_mut(out, frames);
         }
-        let sidechain = extras.sidechain.map(|[left, right]| [std::slice::from_raw_parts(left, frames), std::slice::from_raw_parts(right, frames)]);
         let count = outs.len().min(2);
         plugin.process(Block { channels: &mut channels[..count], sidechain, position: extras.position, playing: extras.playing });
     }
