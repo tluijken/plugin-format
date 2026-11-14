@@ -1,5 +1,6 @@
 use core::ffi::CStr;
 
+pub mod clap;
 mod param;
 
 pub use egui;
@@ -29,7 +30,8 @@ pub trait Plugin: Send + 'static {
     fn param_text(&self, id: u32, plain: f64) -> String;
     fn param_from_text(&self, id: u32, text: &str) -> Option<f64>;
     fn save(&self) -> Vec<u8>;
-    fn load(&mut self, bytes: &[u8]) -> bool;
+    /// Callable from any thread, also while processing.
+    fn load(&self, bytes: &[u8]) -> bool;
     /// Returns the latency to report.
     fn activate(&mut self, sample_rate: f64, max_block: usize, inputs: usize) -> u32;
     fn deactivate(&mut self);
@@ -41,4 +43,13 @@ pub trait Plugin: Send + 'static {
     fn take_latency_changed(&mut self) -> bool;
     /// Called on the GUI thread for every frame while the window is open.
     fn editor(&self) -> Box<dyn FnMut(&egui::Context) + Send>;
+}
+
+/// Exports `$plugin` as the library's CLAP plugin through the `clap_entry` symbol.
+#[macro_export]
+macro_rules! export_clap {
+    ($plugin:ty) => {
+        #[unsafe(no_mangle)]
+        pub static clap_entry: $crate::clap::sys::entry::clap_plugin_entry = $crate::clap::entry::<$plugin>();
+    };
 }
