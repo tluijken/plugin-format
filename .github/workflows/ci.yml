@@ -49,6 +49,17 @@ jobs:
       - name: Bundle
         shell: bash
         run: |
-          scripts/bundle.sh gain Gain com.plugin-format.gain bundles
-          scripts/bundle.sh sidechain Sidechain com.plugin-format.sidechain bundles
+          scripts/bundle.sh gain Gain com.plugin-format.gain bundles/gain
+          scripts/bundle.sh sidechain Sidechain com.plugin-format.sidechain bundles/sidechain
           find bundles
+      # Both validators are built from source on first use, which takes minutes.
+      - name: Validator cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/validators
+          key: validators-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/validators.env') }}
+      - name: Validate
+        shell: bash
+        env:
+          VALIDATORS_DIR: ${{ runner.temp }}/validators
+        run: scripts/validate.sh bundles/gain

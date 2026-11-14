@@ -12,7 +12,7 @@
     in {
       devShells.${system} = {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer pkg-config alsa-lib libx11 libxcb libGL ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer pkg-config alsa-lib libx11 libxcb libGL cmake gnumake jq ];
           shellHook = ''
             export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath runtimeLibs}
           '';

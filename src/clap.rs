@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -34,6 +34,27 @@ use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 use crate::editor::{self, Parent};
 use crate::gui_context::{Event, Wake};
 use crate::{Extras, GuiContext, Kind, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
+
+thread_local! {
+    /// Set while the wrapper applies the host's events on its own thread, which `send` empties the queue of right after.
+    static APPLYING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Clears `APPLYING` again, also when a plugin panics in between.
+struct Applying;
+
+impl Applying {
+    fn start() -> Self {
+        APPLYING.set(true);
+        Applying
+    }
+}
+
+impl Drop for Applying {
+    fn drop(&mut self) {
+        APPLYING.set(false);
+    }
+}
 
 fn same(a: *const c_char, b: &CStr) -> bool {
     !a.is_null() && unsafe { CStr::from_ptr(a) } == b
@@ -215,7 +236,7 @@ impl<P: Plugin> Instance<P> {
             let request_callback = unsafe { instance.host.as_ref() }.and_then(|h| h.request_callback).filter(|_| !state.is_null());
             instance.cx.connect(Box::new(move |wake| {
                 let request = match wake {
-                    Wake::Events => request_flush,
+                    Wake::Events => request_flush.filter(|_| !APPLYING.get()),
                     Wake::Dirty => request_callback,
                 };
                 if let Some(request) = request {
@@ -382,6 +403,7 @@ impl<P: Plugin> Instance<P> {
         if events.is_null() {
             return;
         }
+        let _applying = Applying::start();
         unsafe {
             let (Some(size), Some(get)) = ((*events).size, (*events).get) else { return };
             for i in 0..size(events) {

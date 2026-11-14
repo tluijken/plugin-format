@@ -608,7 +608,7 @@ fn gesture_reaches_the_clap_host_in_order() {
         let mut sent = Vec::new();
         let trigger = vec![param_event(TEST_GESTURE, 1.0)];
         (params.flush.unwrap())(plugin, &events(&trigger), &recorder(&mut sent));
-        assert!(FLUSH_REQUESTS.load(Ordering::SeqCst) > requests, "the host is asked to flush");
+        assert_eq!(FLUSH_REQUESTS.load(Ordering::SeqCst), requests, "no flush request from inside a flush, which sends the events itself");
         let none = Vec::new();
         (params.flush.unwrap())(plugin, &events(&none), &recorder(&mut sent));
         assert_eq!(sent, [Sent::Begin(GAIN), Sent::Value(GAIN, -6.0), Sent::End(GAIN)]);

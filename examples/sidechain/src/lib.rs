@@ -56,6 +56,7 @@ impl Shared for SidechainShared {
 
 pub struct Sidechain {
     shared: Arc<SidechainShared>,
+    inputs: usize,
 }
 
 impl Plugin for Sidechain {
@@ -76,10 +77,11 @@ impl Plugin for Sidechain {
 
     fn new() -> (Self, Arc<SidechainShared>) {
         let shared = Arc::new(SidechainShared { position: AtomicU64::new((-1f64).to_bits()) });
-        (Sidechain { shared: shared.clone() }, shared)
+        (Sidechain { shared: shared.clone(), inputs: 1 }, shared)
     }
 
-    fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
+    fn activate(&mut self, _: f64, _: usize, inputs: usize) -> u32 {
+        self.inputs = inputs;
         0
     }
 
@@ -90,6 +92,11 @@ impl Plugin for Sidechain {
     }
 
     fn process(&mut self, block: Block<'_>) {
+        // The wrapper fills only output channel 0 from a mono input.
+        if self.inputs == 1 && block.channels.len() == 2 {
+            let (left, right) = block.channels.split_at_mut(1);
+            right[0].copy_from_slice(left[0]);
+        }
         if let Some(sidechain) = block.sidechain {
             for (channel, side) in block.channels.iter_mut().zip(sidechain) {
                 for (sample, &add) in channel.iter_mut().zip(side) {

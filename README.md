@@ -19,13 +19,21 @@ nix develop -c cargo test --workspace
 nix develop .#windows -c cargo test --target x86_64-pc-windows-gnu   # MinGW cross build, tests under Wine
 ```
 
-`scripts/bundle.sh <crate> <name> <bundle identifier> <output dir>` builds a plugin in release and lays
+`scripts/bundle.sh <crate> <name> <bundle identifier> <output dir> [<version>]` builds a plugin in release and lays
 it out as hosts look for it: `<name>.clap` and `<name>.vst3` for this system (on macOS universal,
 signed ad hoc bundles), or for the Linux or Windows target in `CARGO_BUILD_TARGET`:
 
 ```sh
 nix develop -c scripts/bundle.sh gain Gain com.example.gain bundles
 nix develop .#windows -c scripts/bundle.sh gain Gain com.example.gain bundles
+```
+
+`scripts/validate.sh <bundle dir>` runs clap-validator and Steinberg's VST3 validator on every `.clap`
+and `.vst3` in a directory. It builds both at the versions in `scripts/validators.env` on first use and
+keeps them in `~/.cache/plugin-format/validators` (or `VALIDATORS_DIR`); CI runs it on the gain example.
+
+```sh
+nix develop -c scripts/validate.sh bundles
 ```
 
 ## Licence

@@ -55,5 +55,7 @@ fn bundle(library: &std::path::Path, path: &std::path::Path, name: &str) -> Path
 "#
     );
     std::fs::write(path.join("Contents/Info.plist"), plist).unwrap();
+    let signed = std::process::Command::new("codesign").args(["--force", "--sign", "-"]).arg(path).status().unwrap();
+    assert!(signed.success(), "codesign failed for {}", path.display());
     binary
 }

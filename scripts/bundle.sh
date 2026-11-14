@@ -7,17 +7,20 @@
 # With CARGO_BUILD_TARGET set to a Linux or Windows target it builds for that one, e.g. Windows from
 # Linux with MinGW.
 #
-# Usage: scripts/bundle.sh <crate> <name> <bundle identifier> <output dir>
+# The version in the macOS Info.plist is <version> or else the crate's own.
+#
+# Usage: scripts/bundle.sh <crate> <name> <bundle identifier> <output dir> [<version>]
 set -euo pipefail
 
-if [ $# -ne 4 ]; then
-    echo "usage: $0 <crate> <name> <bundle identifier> <output dir>" >&2
+if [ $# -lt 4 ] || [ $# -gt 5 ]; then
+    echo "usage: $0 <crate> <name> <bundle identifier> <output dir> [<version>]" >&2
     exit 2
 fi
 crate=$1
 name=$2
 identifier=$3
 out=$4
+version=${5:-}
 lib=${crate//-/_}
 target_dir=${CARGO_TARGET_DIR:-target}
 target=${CARGO_BUILD_TARGET:-}
@@ -60,6 +63,14 @@ case "$os" in
         ;;
     macos)
         cargo build --release -p "$crate" --lib --target aarch64-apple-darwin --target x86_64-apple-darwin
+        if [ -z "$version" ]; then
+            version=$(cargo pkgid -p "$crate" | sed -e 's/.*[#@]//')
+        fi
+        version=${version:-0.0.0}
+        escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+        xml_name=$(escape "$name")
+        xml_identifier=$(escape "$identifier")
+        xml_version=$(escape "$version")
         universal=$(mktemp -d)
         trap 'rm -rf "$universal"' EXIT
         lipo -create -output "$universal/$name" \
@@ -76,17 +87,21 @@ case "$os" in
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleExecutable</key>
-    <string>$name</string>
+    <string>$xml_name</string>
     <key>CFBundleIdentifier</key>
-    <string>$identifier</string>
+    <string>$xml_identifier</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>$name</string>
+    <string>$xml_name</string>
     <key>CFBundlePackageType</key>
     <string>BNDL</string>
     <key>CFBundleSignature</key>
     <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$xml_version</string>
+    <key>CFBundleVersion</key>
+    <string>$xml_version</string>
 </dict>
 </plist>
 EOF
