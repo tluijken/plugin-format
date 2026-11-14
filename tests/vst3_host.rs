@@ -376,6 +376,29 @@ fn processes_and_restores_state() {
 }
 
 #[test]
+fn stereo_arrangement_keeps_left_and_right_apart() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        assert_eq!(plugin.arrange(SpeakerArr::kStereo, SpeakerArr::kStereo), kResultTrue);
+        let mut arrangement = 0;
+        assert_eq!(plugin.processor.getBusArrangement(BusDirections_::kInput as i32, 0, &mut arrangement), kResultOk);
+        assert_eq!(arrangement, SpeakerArr::kStereo);
+        let mut bus: BusInfo = std::mem::zeroed();
+        assert_eq!(plugin.component.getBusInfo(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32, 0, &mut bus), kResultOk);
+        assert_eq!(bus.channelCount, 2);
+
+        plugin.start(128);
+        assert_ne!(plugin.arrange(SpeakerArr::kMono, SpeakerArr::kStereo), kResultTrue, "arranged while active");
+        let mut outputs = [vec![0.0; 128], vec![0.0; 128]];
+        plugin.run(&mut [vec![0.25; 128], vec![0.5; 128]], &mut outputs, 128, None);
+        assert!(outputs[0].iter().all(|&s| s == 0.25), "{:?}", &outputs[0][..4]);
+        assert!(outputs[1].iter().all(|&s| s == 0.5), "{:?}", &outputs[1][..4]);
+        plugin.stop();
+    }
+}
+
+#[test]
 fn a_parameter_change_in_process_reaches_the_controller() {
     let _turn = turn();
     unsafe {
