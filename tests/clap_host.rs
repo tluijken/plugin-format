@@ -701,3 +701,41 @@ fn clap_track_info_reaches_the_plugin() {
         (entry().deinit.unwrap())();
     }
 }
+
+#[test]
+fn a_gesture_outside_a_flush_asks_the_host_to_flush_and_goes_out_with_the_next_one() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
+        let track: &clap_plugin_track_info = extension(plugin, CLAP_EXT_TRACK_INFO);
+        let gesture = [Sent::Begin(GAIN), Sent::Value(GAIN, -6.0), Sent::End(GAIN)];
+        let none = Vec::new();
+        let trigger = |name| {
+            *TRACK.lock().unwrap() = (CLAP_TRACK_INFO_HAS_TRACK_NAME, name, [0; 3]);
+            (track.changed.unwrap())(plugin);
+        };
+
+        // A flush on this thread first, which must not leave the thread looking like it is flushing.
+        let mut sent = Vec::new();
+        (params.flush.unwrap())(plugin, &events(&vec![param_event(TEST_GESTURE, 1.0)]), &recorder(&mut sent));
+        assert_eq!(sent, gesture);
+
+        let requests = FLUSH_REQUESTS.load(Ordering::SeqCst);
+        trigger("Test gesture");
+        assert!(FLUSH_REQUESTS.load(Ordering::SeqCst) > requests, "the host is asked to flush after a flush on this thread");
+        let mut sent = Vec::new();
+        (params.flush.unwrap())(plugin, &events(&none), &recorder(&mut sent));
+        assert_eq!(sent, gesture);
+
+        let requests = FLUSH_REQUESTS.load(Ordering::SeqCst);
+        trigger("Test gesture on a thread");
+        assert!(FLUSH_REQUESTS.load(Ordering::SeqCst) > requests, "the host is asked to flush by another thread");
+        let mut sent = Vec::new();
+        (params.flush.unwrap())(plugin, &events(&none), &recorder(&mut sent));
+        assert_eq!(sent, gesture);
+        *TRACK.lock().unwrap() = (CLAP_TRACK_INFO_HAS_TRACK_NAME | CLAP_TRACK_INFO_HAS_TRACK_COLOR, "Bass", [255, 0, 0]);
+        ((*plugin).destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}

@@ -100,6 +100,22 @@ impl Shared for GainShared {
     }
 
     fn set_track(&self, info: TrackInfo) {
+        match info.name.as_deref() {
+            Some("Test gesture") => self.gesture(),
+            Some("Test gesture on a thread") => {
+                let cx = self.cx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some(cx) = cx {
+                    std::thread::spawn(move || {
+                        cx.begin(GAIN);
+                        cx.set(GAIN, -6.0);
+                        cx.end(GAIN);
+                    })
+                    .join()
+                    .unwrap();
+                }
+            }
+            _ => {}
+        }
         *self.track.lock().unwrap_or_else(|e| e.into_inner()) = info;
     }
 }

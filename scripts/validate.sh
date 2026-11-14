@@ -79,7 +79,7 @@ for plugin in "$bundles"/*.clap; do
             | if ($warnings | length) > 0 then
                 "### clap-validator warnings for \($plugin)\n" +
                 ($warnings | map("- `\(.test[].test)`: \(.status.details | gsub("\n"; " "))") | join("\n")) + "\n"
-              else empty end' "$results" | summary
+              else empty end' "$results" | summary || echo "no warnings summary for $plugin: unexpected validator output" >&2
     fi
 done
 
