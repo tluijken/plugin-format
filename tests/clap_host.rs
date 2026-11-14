@@ -13,7 +13,7 @@ use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, cla
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11, clap_plugin_gui, clap_window, clap_window_handle};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
-use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags, clap_plugin_params};
+use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_param_rescan_flags, clap_plugin_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
@@ -21,7 +21,7 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
-use gain::GAIN;
+use gain::{FREQUENCY, GAIN};
 
 fn plugin_path() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -199,13 +199,26 @@ fn loads_scans_and_processes() {
         assert_eq!(CStr::from_ptr((*desc).id).to_str().unwrap(), "plugin-format.gain");
 
         let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
-        assert_eq!((params.count.unwrap())(plugin), 1);
+        assert_eq!((params.count.unwrap())(plugin), 2);
         let mut info: clap_param_info = std::mem::zeroed();
         assert!((params.get_info.unwrap())(plugin, 0, &mut info));
         assert_eq!(info.id, GAIN);
         assert_eq!(CStr::from_ptr(info.name.as_ptr()).to_str().unwrap(), "Gain");
         assert_ne!(info.flags & CLAP_PARAM_IS_AUTOMATABLE, 0);
         assert_eq!((info.min_value, info.max_value, info.default_value), (-60.0, 24.0, 0.0));
+        assert_ne!(info.flags & CLAP_PARAM_IS_STEPPED, 0);
+        let mut frequency: clap_param_info = std::mem::zeroed();
+        assert!((params.get_info.unwrap())(plugin, 1, &mut frequency));
+        assert_eq!(frequency.id, FREQUENCY);
+        assert_eq!(frequency.flags & CLAP_PARAM_IS_STEPPED, 0);
+        assert_eq!((frequency.min_value, frequency.max_value, frequency.default_value), (20.0, 20000.0, 1000.0));
+        let mut text = [0 as c_char; 32];
+        assert!((params.value_to_text.unwrap())(plugin, FREQUENCY, 1000.0, text.as_mut_ptr(), 32));
+        assert_eq!(CStr::from_ptr(text.as_ptr()).to_str().unwrap(), "1000 Hz");
+        let mut parsed = 0.0;
+        let hz = CString::new("1000 Hz").unwrap();
+        assert!((params.text_to_value.unwrap())(plugin, FREQUENCY, hz.as_ptr(), &mut parsed));
+        assert_eq!(parsed, 1000.0);
         let latency: &clap_plugin_latency = extension(plugin, CLAP_EXT_LATENCY);
         assert_eq!((latency.get.unwrap())(plugin), 0);
 

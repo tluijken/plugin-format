@@ -25,7 +25,7 @@ use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
 use crate::editor::{self, Parent};
-use crate::{Plugin, Shared, copy_str, guard, process_block};
+use crate::{Kind, Plugin, Shared, copy_str, guard, process_block};
 
 fn same(a: *const c_char, b: &CStr) -> bool {
     !a.is_null() && unsafe { CStr::from_ptr(a) } == b
@@ -361,7 +361,7 @@ impl<P: Plugin> Instance<P> {
             if out.is_null() {
                 return false;
             }
-            let mut flags = CLAP_PARAM_IS_STEPPED;
+            let mut flags = if matches!(info.kind, Kind::Float { .. }) { 0 } else { CLAP_PARAM_IS_STEPPED };
             if info.automatable {
                 flags |= CLAP_PARAM_IS_AUTOMATABLE;
             }

@@ -1,4 +1,4 @@
-use plugin_format::{Kind, ParamInfo};
+use plugin_format::{Kind, Map, ParamInfo};
 
 #[test]
 fn every_int_value_survives_normalising_and_back() {
@@ -27,4 +27,29 @@ fn non_finite_values_fall_back_to_the_default() {
     let p = ParamInfo { id: 1, name: "Snapshot", kind: Kind::Int { min: 1, max: 3 }, default: 2.0, automatable: true };
     assert_eq!((p.clamp(f64::NAN), p.clamp(f64::INFINITY), p.clamp(f64::NEG_INFINITY)), (2.0, 2.0, 2.0));
     assert_eq!(p.plain(f64::NAN), 2.0);
+}
+
+#[test]
+fn float_linear_round_trips() {
+    let p = ParamInfo { id: 3, name: "Gain", kind: Kind::Float { min: -30.0, max: 30.0, map: Map::Linear }, default: 0.0, automatable: true };
+    assert_eq!(p.plain(p.normalise(12.5)), 12.5);
+    assert_eq!(p.normalise(0.0), 0.5);
+    assert_eq!(p.step_count(), 0);
+}
+
+#[test]
+fn float_log_round_trips() {
+    let p = ParamInfo { id: 4, name: "Frequency", kind: Kind::Float { min: 20.0, max: 20000.0, map: Map::Log }, default: 1000.0, automatable: true };
+    assert!((p.normalise(632.455_532_033_675_9) - 0.5).abs() < 1e-9);
+    assert!((p.plain(p.normalise(1000.0)) - 1000.0).abs() < 1e-9);
+    assert_eq!((p.normalise(20.0), p.normalise(20000.0)), (0.0, 1.0));
+    assert_eq!(p.step_count(), 0);
+}
+
+#[test]
+fn float_clamp_keeps_fractions_and_replaces_nan() {
+    let p = ParamInfo { id: 3, name: "Gain", kind: Kind::Float { min: -30.0, max: 30.0, map: Map::Linear }, default: 2.5, automatable: true };
+    assert_eq!(p.clamp(1.25), 1.25);
+    assert_eq!(p.clamp(f64::NAN), 2.5);
+    assert_eq!((p.clamp(99.0), p.clamp(-99.0)), (30.0, -30.0));
 }

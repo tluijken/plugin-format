@@ -9,7 +9,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use gain::GAIN;
+use gain::{FREQUENCY, GAIN};
 use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_::{kCanAutomate, kIsList};
 use vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
@@ -310,13 +310,24 @@ fn loads_and_scans_the_factory() {
         let plugin = create();
         let mut controller_cid: TUID = [0; 16];
         assert_ne!(plugin.component.getControllerClassId(&mut controller_cid), kResultOk, "single component");
-        assert_eq!(plugin.controller.getParameterCount(), 1);
+        assert_eq!(plugin.controller.getParameterCount(), 2);
         let mut param: ParameterInfo = std::mem::zeroed();
         assert_eq!(plugin.controller.getParameterInfo(0, &mut param), kResultOk);
         assert_eq!((param.id, wide(&param.title)), (GAIN, "Gain".to_owned()));
         assert_ne!(param.flags & kCanAutomate, 0);
         assert_eq!(param.flags & kIsList, 0);
         assert_eq!((param.stepCount, param.defaultNormalizedValue), (84, normalised(0.0)));
+        let mut frequency: ParameterInfo = std::mem::zeroed();
+        assert_eq!(plugin.controller.getParameterInfo(1, &mut frequency), kResultOk);
+        assert_eq!((frequency.id, frequency.stepCount), (FREQUENCY, 0));
+        let mut text = [0 as TChar; 128];
+        let normalised_1k = plugin.controller.plainParamToNormalized(FREQUENCY, 1000.0);
+        assert_eq!(plugin.controller.getParamStringByValue(FREQUENCY, normalised_1k, &mut text), kResultOk);
+        assert_eq!(wide(&text), "1000 Hz");
+        let mut typed: Vec<TChar> = "1000 Hz".encode_utf16().chain([0]).collect();
+        let mut parsed = 0.0;
+        assert_eq!(plugin.controller.getParamValueByString(FREQUENCY, typed.as_mut_ptr(), &mut parsed), kResultOk);
+        assert!((plugin.controller.normalizedParamToPlain(FREQUENCY, parsed) - 1000.0).abs() < 1e-9);
 
         assert_eq!(plugin.processor.canProcessSampleSize(kSample32 as i32), kResultTrue);
         assert_ne!(plugin.processor.canProcessSampleSize(kSample64 as i32), kResultTrue);

@@ -1,9 +1,17 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Map {
+    Linear,
+    /// Equal normalised steps are equal ratios; `min` must be above zero.
+    Log,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Int { min: i32, max: i32 },
     /// An integer the host should offer as a list of its texts rather than as a number.
     List { min: i32, max: i32 },
     Bool,
+    Float { min: f64, max: f64, map: Map },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +28,7 @@ impl ParamInfo {
         match self.kind {
             Kind::Int { min, .. } | Kind::List { min, .. } => min as f64,
             Kind::Bool => 0.0,
+            Kind::Float { min, .. } => min,
         }
     }
 
@@ -27,6 +36,7 @@ impl ParamInfo {
         match self.kind {
             Kind::Int { max, .. } | Kind::List { max, .. } => max as f64,
             Kind::Bool => 1.0,
+            Kind::Float { max, .. } => max,
         }
     }
 
@@ -34,13 +44,17 @@ impl ParamInfo {
         match self.kind {
             Kind::Int { min, max } | Kind::List { min, max } => max - min,
             Kind::Bool => 1,
+            Kind::Float { .. } => 0,
         }
     }
 
     /// Non-finite input becomes the default, so one bad host value cannot leave state that will not load.
     pub fn clamp(&self, plain: f64) -> f64 {
         let plain = if plain.is_finite() { plain } else { self.default };
-        plain.round().clamp(self.min(), self.max())
+        match self.kind {
+            Kind::Float { .. } => plain.clamp(self.min(), self.max()),
+            _ => plain.round().clamp(self.min(), self.max()),
+        }
     }
 
     pub fn normalise(&self, plain: f64) -> f64 {
@@ -48,11 +62,18 @@ impl ParamInfo {
         if span <= 0.0 {
             return 0.0;
         }
-        (self.clamp(plain) - self.min()) / span
+        let plain = self.clamp(plain);
+        match self.kind {
+            Kind::Float { min, max, map: Map::Log } => (plain / min).ln() / (max / min).ln(),
+            _ => (plain - self.min()) / span,
+        }
     }
 
     pub fn plain(&self, normalised: f64) -> f64 {
         let normalised = normalised.clamp(0.0, 1.0);
-        self.clamp(self.min() + normalised * (self.max() - self.min()))
+        match self.kind {
+            Kind::Float { min, max, map: Map::Log } => self.clamp(min * (max / min).powf(normalised)),
+            _ => self.clamp(self.min() + normalised * (self.max() - self.min())),
+        }
     }
 }
