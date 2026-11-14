@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 #[doc(hidden)]
 pub use clap_sys as sys;
@@ -13,7 +13,7 @@ use clap_sys::events::{CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, clap_ev
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_gui_resize_hints, clap_plugin_gui, clap_window};
-use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
+use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info, clap_plugin_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
@@ -130,9 +130,8 @@ impl<P: Plugin> Factory<P> {
     }
 }
 
-/// `plugin` is used by the main thread only in `activate`, `deactivate`, `destroy` and, while
-/// inactive, `latency.get`, which CLAP never runs alongside processing; by the audio thread only
-/// in `process`, while active. Everything any thread may call goes through `shared`.
+/// `plugin` is used by the main thread only in `activate`, `deactivate` and `destroy`, which CLAP
+/// never runs alongside processing; by the audio thread only in `process`, while active. Everything any thread may call goes through `shared`.
 struct Instance<P: Plugin> {
     clap: clap_plugin,
     host: *const clap_host,
@@ -140,13 +139,16 @@ struct Instance<P: Plugin> {
     shared: Arc<P::Shared>,
     active: AtomicBool,
     inputs: AtomicU32,
-    /// What `activate` reported; the host only learns a new latency by reactivating.
+    /// What `activate` last reported. `latency.get` serves only this, since a host may call it from
+    /// inside `host_latency.changed()` while `activate` still holds the processor.
     latency: AtomicU32,
+    host_latency: AtomicPtr<clap_host_latency>,
 }
 
 impl<P: Plugin> Instance<P> {
     fn create(host: *const clap_host, desc: &'static clap_plugin_descriptor) -> *const clap_plugin {
         let (plugin, shared) = P::new();
+        let latency = plugin.latency();
         let instance = Box::into_raw(Box::new(Instance {
             clap: clap_plugin {
                 desc,
@@ -167,7 +169,8 @@ impl<P: Plugin> Instance<P> {
             shared,
             active: AtomicBool::new(false),
             inputs: AtomicU32::new(1),
-            latency: AtomicU32::new(0),
+            latency: AtomicU32::new(latency),
+            host_latency: AtomicPtr::new(ptr::null_mut()),
         }));
         unsafe {
             (*instance).clap.plugin_data = instance as *mut c_void;
@@ -195,7 +198,11 @@ impl<P: Plugin> Instance<P> {
     }
 
     unsafe extern "C" fn init(plugin: *const clap_plugin) -> bool {
-        Self::with(plugin, || false, |_| true)
+        Self::with(plugin, || false, |instance| {
+            let latency = unsafe { instance.host_extension(CLAP_EXT_LATENCY) } as *mut clap_host_latency;
+            instance.host_latency.store(latency, Ordering::Release);
+            true
+        })
     }
 
     unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
@@ -217,8 +224,14 @@ impl<P: Plugin> Instance<P> {
             }
             let inputs = instance.inputs.load(Ordering::Relaxed) as usize;
             let latency = unsafe { instance.plugin_mut() }.activate(sample_rate, max as usize, inputs);
-            instance.latency.store(latency, Ordering::Relaxed);
+            let previous = instance.latency.swap(latency, Ordering::AcqRel);
             instance.active.store(true, Ordering::Release);
+            if previous != latency
+                && let Some(host_latency) = unsafe { instance.host_latency.load(Ordering::Acquire).as_ref() }
+                && let Some(changed) = host_latency.changed
+            {
+                unsafe { changed(instance.host) };
+            }
             true
         })
     }
@@ -476,11 +489,19 @@ impl<P: Plugin> Instance<P> {
         })
     }
 
+    /// Null when the host lacks the extension.
+    unsafe fn host_extension(&self, id: &CStr) -> *const c_void {
+        unsafe {
+            match self.host.as_ref().and_then(|h| h.get_extension) {
+                Some(get_extension) => get_extension(self.host, id.as_ptr()),
+                None => ptr::null(),
+            }
+        }
+    }
+
     fn rescan_values(&self) {
         unsafe {
-            let Some(host) = self.host.as_ref() else { return };
-            let Some(get_extension) = host.get_extension else { return };
-            let params = get_extension(self.host, CLAP_EXT_PARAMS.as_ptr()) as *const clap_host_params;
+            let params = self.host_extension(CLAP_EXT_PARAMS) as *const clap_host_params;
             if let Some(rescan) = params.as_ref().and_then(|p| p.rescan) {
                 rescan(self.host, CLAP_PARAM_RESCAN_VALUES);
             }
@@ -490,9 +511,7 @@ impl<P: Plugin> Instance<P> {
     const LATENCY: clap_plugin_latency = clap_plugin_latency { get: Some(Self::latency) };
 
     unsafe extern "C" fn latency(plugin: *const clap_plugin) -> u32 {
-        Self::with(plugin, || 0, |instance| {
-            if instance.active.load(Ordering::Acquire) { instance.latency.load(Ordering::Relaxed) } else { unsafe { instance.plugin_mut() }.latency() }
-        })
+        Self::with(plugin, || 0, |instance| instance.latency.load(Ordering::Acquire))
     }
 
     const AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports { count: Some(Self::port_count), get: Some(Self::port) };
@@ -664,6 +683,8 @@ mod tests {
 
     struct Doubler {
         changed: bool,
+        latencies: &'static [u32],
+        activations: usize,
     }
 
     impl Plugin for Doubler {
@@ -680,10 +701,12 @@ mod tests {
         const EDITOR_SIZE: (u32, u32) = (1, 1);
         type Shared = Fixed;
         fn new() -> (Self, Arc<Fixed>) {
-            (Doubler { changed: false }, Arc::new(Fixed))
+            (Doubler { changed: false, latencies: &[5], activations: 0 }, Arc::new(Fixed))
         }
         fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
-            5
+            let latency = self.latencies[self.activations.min(self.latencies.len() - 1)];
+            self.activations += 1;
+            latency
         }
         fn deactivate(&mut self) {}
         fn latency(&self) -> u32 {
@@ -753,6 +776,87 @@ mod tests {
             assert!(((*params).value_to_text.unwrap())(plugin, 7, 1.0, text.as_mut_ptr(), 8));
             assert_eq!(CStr::from_ptr(text.as_ptr()), c"a much ");
             assert!(!((*params).value_to_text.unwrap())(plugin, 8, 1.0, text.as_mut_ptr(), 8));
+            (p.destroy.unwrap())(plugin);
+        }
+    }
+
+    struct Shifter(Doubler);
+
+    impl Plugin for Shifter {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        type Shared = Fixed;
+        fn new() -> (Self, Arc<Fixed>) {
+            (Shifter(Doubler { changed: false, latencies: &[5, 5, 9], activations: 0 }), Arc::new(Fixed))
+        }
+        fn activate(&mut self, rate: f64, block: usize, inputs: usize) -> u32 {
+            self.0.activate(rate, block, inputs)
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, channels: &mut [&mut [f32]]) {
+            self.0.process(channels)
+        }
+        fn take_latency_changed(&mut self) -> bool {
+            self.0.take_latency_changed()
+        }
+    }
+
+    static SHIFTER: std::sync::atomic::AtomicPtr<clap_plugin> = std::sync::atomic::AtomicPtr::new(ptr::null_mut());
+    static CHANGES: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn latency_changed(_: *const clap_host) {
+        CHANGES.fetch_add(1, Ordering::SeqCst);
+        let plugin = SHIFTER.load(Ordering::SeqCst);
+        unsafe {
+            let latency = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_LATENCY.as_ptr()) as *const clap_plugin_latency;
+            SEEN.store(((*latency).get.unwrap())(plugin), Ordering::SeqCst);
+        }
+    }
+
+    static HOST_LATENCY: clap_host_latency = clap_host_latency { changed: Some(latency_changed) };
+
+    unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+        if same(id, CLAP_EXT_LATENCY) { &HOST_LATENCY as *const _ as *const c_void } else { ptr::null() }
+    }
+
+    #[test]
+    fn activate_tells_the_host_when_the_latency_differs_from_the_last_one() {
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: ptr::null_mut(),
+            name: c"".as_ptr(),
+            vendor: c"".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"".as_ptr(),
+            get_extension: Some(host_extension),
+            request_restart: None,
+            request_process: None,
+            request_callback: None,
+        };
+        unsafe {
+            let factory = &Factory::<Shifter>::FACTORY;
+            let plugin = (factory.create_plugin.unwrap())(factory, &host, descriptor::<Shifter>().id);
+            SHIFTER.store(plugin as *mut _, Ordering::SeqCst);
+            let p = &*plugin;
+            assert!((p.init.unwrap())(plugin));
+            let latency = (p.get_extension.unwrap())(plugin, CLAP_EXT_LATENCY.as_ptr()) as *const clap_plugin_latency;
+            assert_eq!(((*latency).get.unwrap())(plugin), 0);
+
+            assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 16));
+            assert_eq!((CHANGES.load(Ordering::SeqCst), SEEN.load(Ordering::SeqCst)), (1, 5));
+            (p.deactivate.unwrap())(plugin);
+            assert_eq!(((*latency).get.unwrap())(plugin), 5, "inactive keeps the last reported latency");
+
+            assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 16));
+            assert_eq!(CHANGES.load(Ordering::SeqCst), 1, "unchanged latency is not announced");
+            (p.deactivate.unwrap())(plugin);
+
+            assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 16));
+            assert_eq!((CHANGES.load(Ordering::SeqCst), SEEN.load(Ordering::SeqCst)), (2, 9));
             (p.destroy.unwrap())(plugin);
         }
     }

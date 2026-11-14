@@ -42,6 +42,7 @@ pub trait Plugin: Send + Sized + 'static {
     /// Returns the latency to report.
     fn activate(&mut self, sample_rate: f64, max_block: usize, inputs: usize) -> u32;
     fn deactivate(&mut self);
+    /// Read once before the first `activate`; after that the wrapper reports what `activate` returned.
     fn latency(&self) -> u32;
     /// `channels` are the output channels, filled with the input beforehand by the wrapper
     /// (mono input copied to output channel 0 only).

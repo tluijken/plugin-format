@@ -21,3 +21,10 @@ fn out_of_range_values_are_clamped_and_rounded() {
     assert_eq!((p.clamp(-4.0), p.clamp(9.0), p.clamp(2.4)), (1.0, 3.0, 2.0));
     assert_eq!((p.plain(-0.5), p.plain(1.5)), (1.0, 3.0));
 }
+
+#[test]
+fn non_finite_values_fall_back_to_the_default() {
+    let p = ParamInfo { id: 1, name: "Snapshot", kind: Kind::Int { min: 1, max: 3 }, default: 2.0, automatable: true };
+    assert_eq!((p.clamp(f64::NAN), p.clamp(f64::INFINITY), p.clamp(f64::NEG_INFINITY)), (2.0, 2.0, 2.0));
+    assert_eq!(p.plain(f64::NAN), 2.0);
+}

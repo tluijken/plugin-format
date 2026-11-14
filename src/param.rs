@@ -35,7 +35,9 @@ impl ParamInfo {
         }
     }
 
+    /// Non-finite input becomes the default, so one bad host value cannot leave state that will not load.
     pub fn clamp(&self, plain: f64) -> f64 {
+        let plain = if plain.is_finite() { plain } else { self.default };
         plain.round().clamp(self.min(), self.max())
     }
 
