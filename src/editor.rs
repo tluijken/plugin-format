@@ -152,7 +152,7 @@ struct Editor {
 }
 
 impl App for Editor {
-    /// Runs on baseview's own thread on X11, before anything of the window exists on it.
+    /// Runs once on the window's thread, before the first frame.
     fn build(&mut self, ctx: egui::Context, frame: &mut Frame) -> Result<(), baseview::HandlerError> {
         #[cfg(target_os = "linux")]
         x11::signal_on_thread_exit(self.finished.clone());
