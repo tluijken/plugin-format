@@ -304,7 +304,7 @@ impl<P: Plugin> Component<P> {
             claimed: AtomicBool::new(false),
             shared,
             active: AtomicBool::new(false),
-            inputs: AtomicU32::new(1),
+            inputs: AtomicU32::new(crate::default_inputs::<P>()),
             sidechain_active: AtomicBool::new(false),
             sample_rate: AtomicU64::new(0),
             max_block: AtomicU32::new(0),
@@ -1673,5 +1673,54 @@ mod tests {
             assert!(!cx.request_resize(900, 900), "nothing to resize once the view is removed");
             assert_eq!(plug_view.setFrame(ptr::null_mut()), kResultOk);
         }
+    }
+
+    struct StereoFirst(Doubler);
+
+    impl Plugin for StereoFirst {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        const LAYOUTS: &'static [crate::Layout] =
+            &[crate::Layout { name: "Stereo", main_inputs: 2 }, crate::Layout { name: "Mono in, stereo out", main_inputs: 1 }];
+        type Shared = Fixed;
+        fn new() -> (Self, Arc<Fixed>) {
+            (StereoFirst(Doubler { latencies: &[0], activations: 0, latency: 0, changed: false }), Arc::new(Fixed))
+        }
+        fn activate(&mut self, rate: f64, block: usize, inputs: usize) -> u32 {
+            self.0.activate(rate, block, inputs)
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, block: Block<'_>) {
+            self.0.process(block)
+        }
+        fn take_latency_changed(&mut self) -> bool {
+            self.0.take_latency_changed()
+        }
+    }
+
+    fn default_input_arrangement<P: Plugin>() -> SpeakerArrangement {
+        unsafe {
+            let factory = ComPtr::from_raw(factory::<P>() as *mut IPluginFactory).unwrap();
+            let mut obj = ptr::null_mut();
+            let cid = class_id::<P>();
+            assert_eq!(factory.createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj), kResultOk);
+            let component = ComPtr::from_raw(obj as *mut IComponent).unwrap();
+            let processor = component.cast::<IAudioProcessor>().unwrap();
+            let mut arrangement = 0;
+            assert_eq!(processor.getBusArrangement(kInput as BusDirection, 0, &mut arrangement), kResultOk);
+            let mut info: BusInfo = std::mem::zeroed();
+            assert_eq!(component.getBusInfo(kAudio as MediaType, kInput as BusDirection, 0, &mut info), kResultOk);
+            assert_eq!(info.channelCount, arrangement.count_ones() as int32);
+            arrangement
+        }
+    }
+
+    #[test]
+    fn vst3_default_layout_is_the_first() {
+        assert_eq!(default_input_arrangement::<StereoFirst>(), SpeakerArr::kStereo);
+        assert_eq!(default_input_arrangement::<Doubler>(), SpeakerArr::kMono);
     }
 }

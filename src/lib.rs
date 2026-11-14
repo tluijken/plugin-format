@@ -24,6 +24,14 @@ pub struct Info {
     pub sidechain: bool,
 }
 
+/// One main input arrangement a plugin offers; the output is always stereo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub name: &'static str,
+    /// The main input's channel count, 1 or 2.
+    pub main_inputs: u32,
+}
+
 /// What one call of `Plugin::process` works on.
 pub struct Block<'a> {
     /// The output channels, filled with the input beforehand by the wrapper (mono input copied to
@@ -82,6 +90,9 @@ pub trait Plugin: Send + Sized + 'static {
     const RESIZABLE: bool = false;
     /// The smallest size, at a scale of 1.0, a `RESIZABLE` editor takes.
     const EDITOR_MIN: (u32, u32) = Self::EDITOR_SIZE;
+    /// The main input layouts offered to the host, never empty. The first is the default: the CLAP
+    /// config and the VST3 bus arrangement a host gets until it picks another.
+    const LAYOUTS: &'static [Layout] = &[Layout { name: "Mono in, stereo out", main_inputs: 1 }, Layout { name: "Stereo in, stereo out", main_inputs: 2 }];
     type Shared: Shared;
     fn new() -> (Self, std::sync::Arc<Self::Shared>);
     /// `inputs` is the main input bus the host chose: 1 (mono in, stereo out) or 2 (stereo/stereo).
@@ -149,6 +160,11 @@ macro_rules! export_vst3 {
             true
         }
     };
+}
+
+fn default_inputs<P: Plugin>() -> u32 {
+    const { assert!(!P::LAYOUTS.is_empty(), "a plugin needs at least one layout") };
+    P::LAYOUTS[0].main_inputs
 }
 
 fn guard<R>(failed: R, body: impl FnOnce() -> R) -> R {

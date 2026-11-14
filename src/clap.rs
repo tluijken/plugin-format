@@ -33,7 +33,7 @@ use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
 use crate::editor::{self, Parent};
 use crate::gui_context::{Event, Wake};
-use crate::{Extras, GuiContext, Kind, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
+use crate::{Extras, GuiContext, Kind, Layout, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
 
 thread_local! {
     /// Set while the wrapper applies the host's events on its own thread, which `send` empties the queue of right after.
@@ -190,7 +190,7 @@ impl<P: Plugin> Instance<P> {
             plugin: UnsafeCell::new(plugin),
             shared,
             active: AtomicBool::new(false),
-            inputs: AtomicU32::new(1),
+            inputs: AtomicU32::new(crate::default_inputs::<P>()),
             sample_rate: AtomicU64::new(0),
             latency: AtomicU32::new(latency),
             host_latency: AtomicPtr::new(ptr::null_mut()),
@@ -678,12 +678,12 @@ impl<P: Plugin> Instance<P> {
         clap_plugin_audio_ports_config { count: Some(Self::config_count), get: Some(Self::config), select: Some(Self::select) };
 
     unsafe extern "C" fn config_count(_: *const clap_plugin) -> u32 {
-        CONFIGS.len() as u32
+        P::LAYOUTS.len() as u32
     }
 
     unsafe extern "C" fn config(_: *const clap_plugin, index: u32, out: *mut clap_audio_ports_config) -> bool {
         guard(false, || {
-            let Some(&(name, inputs)) = CONFIGS.get(index as usize) else { return false };
+            let Some(&Layout { name, main_inputs: inputs }) = P::LAYOUTS.get(index as usize) else { return false };
             if out.is_null() {
                 return false;
             }
@@ -707,7 +707,7 @@ impl<P: Plugin> Instance<P> {
 
     unsafe extern "C" fn select(plugin: *const clap_plugin, id: clap_id) -> bool {
         Self::with(plugin, || false, |instance| {
-            let Some(&(_, inputs)) = CONFIGS.get(id as usize) else { return false };
+            let Some(&Layout { main_inputs: inputs, .. }) = P::LAYOUTS.get(id as usize) else { return false };
             if instance.active.load(Ordering::Acquire) {
                 return false;
             }
@@ -928,9 +928,6 @@ impl<P: Plugin> Instance<P> {
         Self::with_gui(plugin, || false, |gui| gui.window.as_ref().is_some_and(editor::Window::hide))
     }
 }
-
-/// Config id is the index; the second field is the main input's channel count.
-const CONFIGS: [(&str, u32); 2] = [("Mono in, stereo out", 1), ("Stereo in, stereo out", 2)];
 
 fn port_type(channels: u32) -> *const c_char {
     if channels == 1 { CLAP_PORT_MONO.as_ptr() } else { CLAP_PORT_STEREO.as_ptr() }
@@ -1348,6 +1345,73 @@ mod tests {
             assert!(!cx.request_resize(900, 900), "nothing to resize once the gui is gone");
             assert_eq!(ASKED.lock().unwrap().len(), 2);
             (p.destroy.unwrap())(plugin);
+        }
+    }
+
+    struct StereoFirst(Doubler);
+
+    impl Plugin for StereoFirst {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        const LAYOUTS: &'static [Layout] = &[Layout { name: "Stereo", main_inputs: 2 }, Layout { name: "Mono in, stereo out", main_inputs: 1 }];
+        type Shared = Fixed;
+        fn new() -> (Self, Arc<Fixed>) {
+            (StereoFirst(Doubler { changed: false, latencies: &[0], activations: 0 }), Arc::new(Fixed))
+        }
+        fn activate(&mut self, rate: f64, block: usize, inputs: usize) -> u32 {
+            self.0.activate(rate, block, inputs)
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, block: Block<'_>) {
+            self.0.process(block)
+        }
+        fn take_latency_changed(&mut self) -> bool {
+            self.0.take_latency_changed()
+        }
+    }
+
+    unsafe fn main_input_channels<P: Plugin>() -> u32 {
+        unsafe {
+            let host = clap_host {
+                clap_version: CLAP_VERSION,
+                host_data: ptr::null_mut(),
+                name: c"".as_ptr(),
+                vendor: c"".as_ptr(),
+                url: c"".as_ptr(),
+                version: c"".as_ptr(),
+                get_extension: None,
+                request_restart: None,
+                request_process: None,
+                request_callback: None,
+            };
+            let factory = &Factory::<P>::FACTORY;
+            let plugin = (factory.create_plugin.unwrap())(factory, &host, c"test.doubler".as_ptr());
+            let ports = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) as *const clap_plugin_audio_ports;
+            let mut info: clap_audio_port_info = std::mem::zeroed();
+            assert!(((*ports).get.unwrap())(plugin, 0, true, &mut info));
+            let channels = info.channel_count;
+            ((*plugin).destroy.unwrap())(plugin);
+            channels
+        }
+    }
+
+    #[test]
+    fn clap_default_layout_is_the_first() {
+        unsafe {
+            assert_eq!(main_input_channels::<StereoFirst>(), 2);
+            assert_eq!(main_input_channels::<Doubler>(), 1);
+
+            let configs = |index| {
+                let mut config: clap_audio_ports_config = std::mem::zeroed();
+                assert!(Instance::<StereoFirst>::config(ptr::null(), index, &mut config));
+                (CStr::from_ptr(config.name.as_ptr()).to_str().unwrap().to_owned(), config.main_input_channel_count, config.input_port_count)
+            };
+            assert_eq!(Instance::<StereoFirst>::config_count(ptr::null()), 2);
+            assert_eq!(configs(0), ("Stereo".to_owned(), 2, 1));
+            assert_eq!(configs(1), ("Mono in, stereo out".to_owned(), 1, 1));
         }
     }
 }
