@@ -621,8 +621,9 @@ impl<P: Plugin> Instance<P> {
             |instance| {
                 instance.apply(events);
                 instance.send(out);
-                // Not from the audio thread, where an active plugin is flushed and which request_flush forbids.
-                if !instance.active.load(Ordering::Acquire) && instance.cx.pending() {
+                // Not from the audio thread, where an active plugin is flushed and which request_flush forbids, and
+                // not without an output list to take events, which no further flush would change. One request per flush.
+                if !out.is_null() && !instance.active.load(Ordering::Acquire) && instance.cx.pending() {
                     instance.cx.wake_events();
                 }
             },

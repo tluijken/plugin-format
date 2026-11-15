@@ -763,3 +763,18 @@ fn a_flush_the_host_took_everything_from_asks_for_no_other() {
         (entry().deinit.unwrap())();
     }
 }
+
+#[test]
+fn a_flush_without_an_output_list_does_not_ask_for_another() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
+        let trigger = vec![param_event(TEST_GESTURE, 1.0)];
+        let requests = FLUSH_REQUESTS.load(Ordering::SeqCst);
+        (params.flush.unwrap())(plugin, &events(&trigger), ptr::null());
+        assert_eq!(FLUSH_REQUESTS.load(Ordering::SeqCst), requests, "another flush would have nowhere to send them either");
+        ((*plugin).destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
