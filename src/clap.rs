@@ -616,11 +616,16 @@ impl<P: Plugin> Instance<P> {
                     instance.apply(events);
                 }
                 instance.send(out);
+                // Not from the audio thread, where an active plugin is flushed and which request_flush forbids.
+                if !instance.active.load(Ordering::Acquire) && instance.cx.pending() {
+                    instance.cx.wake_events();
+                }
             },
         )
     }
 
-    /// What the editor did, for as much as the host takes; the rest goes with the next call.
+    /// What the editor did, for as much as the host takes; the rest goes with the next call. A flush of an
+    /// active plugin does not ask for one, as it runs on the audio thread, so there it waits for the next block.
     fn send(&self, out: *const clap_output_events) {
         let Some(try_push) = (unsafe { out.as_ref() }).and_then(|o| o.try_push) else { return };
         let header = |type_, size: usize| clap_event_header { size: size as u32, time: 0, space_id: CLAP_CORE_EVENT_SPACE_ID, type_, flags: 0 };

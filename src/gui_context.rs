@@ -114,6 +114,16 @@ impl GuiContext {
     pub(crate) fn take_dirty(&self) -> bool {
         self.0.dirty.swap(false, Ordering::AcqRel)
     }
+
+    /// Whether events wait that no drain took.
+    pub(crate) fn pending(&self) -> bool {
+        self.0.queue.pending()
+    }
+
+    /// Lets the wrapper hear again of the events that wait.
+    pub(crate) fn wake_events(&self) {
+        self.0.wake(Wake::Events);
+    }
 }
 
 type Waker = Box<dyn Fn(Wake) + Send + Sync>;
@@ -280,6 +290,10 @@ impl Queue {
             self.overflowing.store(false, Ordering::Release);
         }
         moved
+    }
+
+    fn pending(&self) -> bool {
+        self.head.load(Ordering::Acquire) != self.tail.load(Ordering::Acquire) || self.overflowing.load(Ordering::Acquire)
     }
 
     fn drain(&self, mut deliver: impl FnMut(Event) -> bool) {

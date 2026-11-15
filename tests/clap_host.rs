@@ -613,7 +613,9 @@ fn a_gesture_the_host_refused_goes_out_with_the_next_block() {
         let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
         let trigger = vec![param_event(TEST_GESTURE, 1.0)];
         let full = clap_output_events { ctx: ptr::null_mut(), try_push: Some(refuse_event) };
+        let requests = FLUSH_REQUESTS.load(Ordering::SeqCst);
         (params.flush.unwrap())(plugin, &events(&trigger), &full);
+        assert!(FLUSH_REQUESTS.load(Ordering::SeqCst) > requests, "an inactive plugin asks the host for the flush that takes what it refused");
 
         assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 64));
         assert!((p.start_processing.unwrap())(plugin));
@@ -741,6 +743,23 @@ fn processing_flushes_subnormals_and_leaves_the_hosts_flags_alone() {
         (p.stop_processing.unwrap())(plugin);
         (p.deactivate.unwrap())(plugin);
         (p.destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+#[test]
+fn a_flush_the_host_took_everything_from_asks_for_no_other() {
+    let _turn = turn();
+    unsafe {
+        let plugin = create();
+        let params: &clap_plugin_params = extension(plugin, CLAP_EXT_PARAMS);
+        let trigger = vec![param_event(TEST_GESTURE, 1.0)];
+        let requests = FLUSH_REQUESTS.load(Ordering::SeqCst);
+        let mut sent = Vec::new();
+        (params.flush.unwrap())(plugin, &events(&trigger), &recorder(&mut sent));
+        assert_eq!(sent.len(), 3);
+        assert_eq!(FLUSH_REQUESTS.load(Ordering::SeqCst), requests);
+        ((*plugin).destroy.unwrap())(plugin);
         (entry().deinit.unwrap())();
     }
 }
