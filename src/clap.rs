@@ -219,6 +219,10 @@ impl<P: Plugin> Instance<P> {
         }
     }
 
+    /// The instance behind `plugin`, or `None` for a null one or one without instance data.
+    ///
+    /// # Safety
+    /// `plugin` is null or one this library made that has not been destroyed, and stays so for `'a`.
     unsafe fn from<'a>(plugin: *const clap_plugin) -> Option<&'a Self> {
         unsafe {
             if plugin.is_null() || (*plugin).plugin_data.is_null() {
@@ -228,7 +232,8 @@ impl<P: Plugin> Instance<P> {
         }
     }
 
-    /// Callers hold the exclusivity described on `Instance`.
+    /// # Safety
+    /// The caller has the exclusivity described on `Instance`: nothing else uses the plugin meanwhile.
     #[allow(clippy::mut_from_ref)]
     unsafe fn plugin_mut(&self) -> &mut P {
         unsafe { &mut *self.plugin.get() }
@@ -366,7 +371,9 @@ impl<P: Plugin> Instance<P> {
         )
     }
 
-    /// The audio thread has `plugin` to itself while active, which makes `plugin_mut` sound here.
+    /// # Safety
+    /// Called from the audio thread of an active plugin, which has `plugin` to itself, and with the
+    /// host's `process`: its buffers hold `frames_count` valid frames for the call.
     unsafe fn run(&self, process: &clap_process) -> clap_process_status {
         unsafe {
             let frames = process.frames_count as usize;
@@ -406,6 +413,10 @@ impl<P: Plugin> Instance<P> {
     }
 
     /// The second input port when the plugin has one and the host connected both its channels.
+    ///
+    /// # Safety
+    /// `process.audio_inputs` holds `audio_inputs_count` valid buffers, each with `channel_count`
+    /// pointers in `data32`.
     unsafe fn sidechain(&self, process: &clap_process) -> Option<[*const f32; 2]> {
         unsafe {
             if !P::INFO.sidechain || process.audio_inputs_count < 2 || process.audio_inputs.is_null() {
@@ -680,6 +691,9 @@ impl<P: Plugin> Instance<P> {
     }
 
     /// Null when the host lacks the extension.
+    ///
+    /// # Safety
+    /// `self.host` is the host this plugin was created with, which is still alive.
     unsafe fn host_extension(&self, id: &CStr) -> *const c_void {
         unsafe {
             match self.host.as_ref().and_then(|h| h.get_extension) {
@@ -1373,6 +1387,8 @@ mod tests {
         }
     }
 
+    /// # Safety
+    /// `plugin` is a live plugin.
     unsafe fn gui_size_of(gui: &clap_plugin_gui, plugin: *const clap_plugin) -> (u32, u32) {
         let (mut width, mut height) = (0, 0);
         assert!(unsafe { (gui.get_size.unwrap())(plugin, &mut width, &mut height) });
@@ -1497,6 +1513,8 @@ mod tests {
         }
     }
 
+    /// # Safety
+    /// `P`'s CLAP id is `test.doubler`, which the factory looks the plugin up by.
     unsafe fn main_input_channels<P: Plugin>() -> u32 {
         unsafe {
             let host = clap_host {

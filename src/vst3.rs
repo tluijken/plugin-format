@@ -41,6 +41,9 @@ fn copy_wide(text: &str, out: &mut [TChar]) {
 }
 
 /// Reads a NUL-terminated string the host hands over, giving up after 1024 units.
+///
+/// # Safety
+/// `text` is valid for reads up to and including its terminator, or for 1024 units.
 unsafe fn read_wide(text: *const TChar) -> Option<String> {
     let mut units = Vec::new();
     for i in 0..1024 {
@@ -420,6 +423,9 @@ impl<P: Plugin> Component<P> {
     }
 
     /// The aux input bus when the plugin has one, the host activated it and gave both its channels.
+    ///
+    /// # Safety
+    /// `data.inputs` holds `data.numInputs` valid buses, each with `numChannels` pointers in `channelBuffers32`.
     unsafe fn sidechain(&self, data: &ProcessData) -> Option<[*const f32; 2]> {
         unsafe {
             if !P::INFO.sidechain || !self.sidechain_active.load(Ordering::Acquire) || data.numInputs < 2 || data.inputs.is_null() {
@@ -444,6 +450,8 @@ impl<P: Plugin> Component<P> {
         unsafe { data.processContext.as_ref() }.is_some_and(|context| context.state & kPlaying as uint32 != 0)
     }
 
+    /// # Safety
+    /// Called from `process` with the host's data: its buses hold `numSamples` valid frames for the call.
     unsafe fn run(&self, data: &ProcessData) -> tresult {
         unsafe {
             if data.numSamples <= 0 {
