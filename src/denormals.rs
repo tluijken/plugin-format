@@ -15,21 +15,23 @@ thread_local! {
 pub(crate) struct FlushDenormals {
     /// The caller's state, when it had the flags off and this turned them on.
     saved: Option<arch::State>,
+    /// What `HOST` held before this changed it, for a guard that nests in a call into the host.
+    outer: Option<arch::State>,
 }
 
 impl FlushDenormals {
     pub(crate) fn new() -> Self {
         let state = arch::get();
         if state & arch::FLUSH == arch::FLUSH {
-            return Self { saved: None };
+            return Self { saved: None, outer: None };
         }
         // SAFETY: Rust and LLVM assume the default floating-point environment, so changing FTZ/DAZ
         // around Rust code is outside what they promise; it is accepted audio practice all the same.
         // Only subnormal results change, the guarded region reaches its data through memory, and
         // the asm's memory clobber keeps those loads and stores between the two writes.
         arch::set(state | arch::FLUSH);
-        HOST.set(Some(state));
-        Self { saved: Some(state) }
+        let outer = HOST.replace(Some(state));
+        Self { saved: Some(state), outer }
     }
 }
 
@@ -37,7 +39,7 @@ impl Drop for FlushDenormals {
     fn drop(&mut self) {
         if let Some(state) = self.saved {
             arch::set(state);
-            HOST.set(None);
+            HOST.set(self.outer);
         }
     }
 }
@@ -143,6 +145,14 @@ mod tests {
         let panicked = std::panic::catch_unwind(|| with_host_flags(|| panic!("the host failed")));
         assert!(panicked.is_err());
         assert_eq!(product(), 0.0, "flushing again after a panic");
+    }
+
+    #[test]
+    fn a_guard_made_inside_a_call_into_the_host_leaves_the_outer_one_intact() {
+        let _outer = FlushDenormals::new();
+        with_host_flags(|| drop(FlushDenormals::new()));
+        assert!(with_host_flags(product).is_subnormal(), "the host's flags are still the ones to give back");
+        assert_eq!(product(), 0.0);
     }
 
     #[test]
