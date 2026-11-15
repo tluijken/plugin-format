@@ -1,5 +1,9 @@
 //! Loads a VST3 module and calls its platform's entry point, as a host does before anything else.
 
+use vst3::Steinberg::Vst::{IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait, IEditController};
+use vst3::Steinberg::{IPluginBaseTrait, IPluginFactory, IPluginFactoryTrait, PClassInfo, TUID, kResultOk};
+use vst3::{ComPtr, Interface};
+
 use crate::built::Built;
 
 /// Stays loaded for the whole run, as it would in a host.
@@ -50,6 +54,54 @@ mod mac {
             CFRelease(cf_bundle);
             CFRelease(url);
             entered
+        }
+    }
+}
+
+/// The library's factory, as `GetPluginFactory` gives it.
+pub fn factory(library: &libloading::Library) -> ComPtr<IPluginFactory> {
+    unsafe {
+        let get: libloading::Symbol<extern "system" fn() -> *mut IPluginFactory> = library.get(b"GetPluginFactory\0").unwrap();
+        ComPtr::from_raw(get()).expect("a factory")
+    }
+}
+
+/// The class id of the library's first class.
+pub fn class_id(library: &libloading::Library) -> TUID {
+    unsafe {
+        let mut info: PClassInfo = std::mem::zeroed();
+        assert_eq!(factory(library).getClassInfo(0, &mut info), kResultOk);
+        info.cid
+    }
+}
+
+/// One instance of the library's plugin, as a host holds it.
+pub struct Instance {
+    pub component: ComPtr<IComponent>,
+    pub processor: ComPtr<IAudioProcessor>,
+    pub controller: ComPtr<IEditController>,
+}
+
+impl Instance {
+    /// Creates and initialises an instance of the library's first class.
+    pub fn create(library: &libloading::Library) -> Instance {
+        unsafe {
+            let mut obj = std::ptr::null_mut();
+            let result = factory(library).createInstance(class_id(library).as_ptr(), IComponent::IID.as_ptr() as vst3::Steinberg::FIDString, &mut obj);
+            assert_eq!(result, kResultOk);
+            let component = ComPtr::from_raw(obj as *mut IComponent).expect("a component");
+            assert_eq!(component.initialize(std::ptr::null_mut()), kResultOk);
+            let processor = component.cast::<IAudioProcessor>().expect("IAudioProcessor");
+            let controller = component.cast::<IEditController>().expect("IEditController");
+            Instance { component, processor, controller }
+        }
+    }
+
+    pub fn stop(&self) {
+        unsafe {
+            self.processor.setProcessing(0);
+            assert_eq!(self.component.setActive(0), kResultOk);
+            assert_eq!(self.component.terminate(), kResultOk);
         }
     }
 }

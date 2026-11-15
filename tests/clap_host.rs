@@ -28,10 +28,10 @@ use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
 use clap_sys::stream::{clap_istream, clap_ostream};
-use clap_sys::version::CLAP_VERSION;
 use gain::{FREQUENCY, GAIN, TEST_GESTURE};
 
 mod built;
+mod clap_module;
 
 fn plugin() -> &'static built::Built {
     static PLUGIN: OnceLock<built::Built> = OnceLock::new();
@@ -66,19 +66,10 @@ fn turn() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn library() -> &'static libloading::Library {
-    static LIBRARY: OnceLock<libloading::Library> = OnceLock::new();
-    LIBRARY.get_or_init(|| unsafe { libloading::Library::new(&plugin().binary).unwrap() })
-}
-
 unsafe fn entry() -> &'static clap_plugin_entry {
-    unsafe {
-        let entry: libloading::Symbol<*const clap_plugin_entry> = library().get(b"clap_entry\0").unwrap();
-        &**entry
-    }
+    unsafe { clap_module::load(&plugin().binary) }
 }
 
-unsafe extern "C" fn nothing(_: *const clap_host) {}
 unsafe extern "C" fn drop_event(_: *const clap_output_events, _: *const clap_event_header) -> bool {
     true
 }
@@ -136,32 +127,11 @@ unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *
     }
 }
 
-static HOST: clap_host = clap_host {
-    clap_version: CLAP_VERSION,
-    host_data: ptr::null_mut(),
-    name: c"plugin-format test host".as_ptr(),
-    vendor: c"".as_ptr(),
-    url: c"".as_ptr(),
-    version: c"0".as_ptr(),
-    get_extension: Some(host_extension),
-    request_restart: Some(nothing),
-    request_process: Some(nothing),
-    request_callback: Some(request_callback),
-};
+static HOST: clap_host = clap_module::host(Some(host_extension), Some(request_callback));
 
 /// An initialised plugin instance from the shared library.
 unsafe fn create() -> *const clap_plugin {
-    unsafe {
-        let entry = entry();
-        let path = CString::new(plugin().path.to_str().unwrap()).unwrap();
-        assert!((entry.init.unwrap())(path.as_ptr()));
-        let factory = (entry.get_factory.unwrap())(CLAP_PLUGIN_FACTORY_ID.as_ptr()) as *const clap_plugin_factory;
-        let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
-        let plugin = ((*factory).create_plugin.unwrap())(factory, &HOST, (*desc).id);
-        assert!(!plugin.is_null());
-        assert!(((*plugin).init.unwrap())(plugin));
-        plugin
-    }
+    unsafe { clap_module::create_at(entry(), &plugin().path, &HOST) }
 }
 
 unsafe fn extension<T>(plugin: *const clap_plugin, id: &CStr) -> &'static T {

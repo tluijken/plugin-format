@@ -1,6 +1,6 @@
 //! Loads the sidechain example's CLAP library and checks what a host gives the plugin besides the main input.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -10,15 +10,14 @@ use clap_sys::events::{CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_IS_PL
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_config::{CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_plugin_params};
-use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
-use clap_sys::version::CLAP_VERSION;
 use sidechain::POSITION;
 
 mod built;
+mod clap_module;
 
 fn plugin() -> &'static built::Built {
     static PLUGIN: OnceLock<built::Built> = OnceLock::new();
@@ -33,40 +32,17 @@ fn turn() -> MutexGuard<'static, ()> {
 
 unsafe extern "C" fn nothing(_: *const clap_host) {}
 
-static HOST: clap_host = clap_host {
-    clap_version: CLAP_VERSION,
-    host_data: ptr::null_mut(),
-    name: c"plugin-format test host".as_ptr(),
-    vendor: c"".as_ptr(),
-    url: c"".as_ptr(),
-    version: c"0".as_ptr(),
-    get_extension: None,
-    request_restart: Some(nothing),
-    request_process: Some(nothing),
-    request_callback: Some(nothing),
-};
+static HOST: clap_host = clap_module::host(None, Some(nothing));
 
-/// The library stays loaded for the whole run, as it would in a host.
 unsafe fn entry() -> &'static clap_plugin_entry {
-    unsafe {
-        let library = Box::leak(Box::new(libloading::Library::new(&plugin().binary).unwrap()));
-        let entry: libloading::Symbol<*const clap_plugin_entry> = library.get(b"clap_entry\0").unwrap();
-        &**entry
-    }
+    unsafe { clap_module::load(&plugin().binary) }
 }
 
 /// An initialised plugin set to the stereo main input, active with room for 128 frames.
 unsafe fn active() -> *const clap_plugin {
     unsafe {
-        let entry = entry();
-        let path = CString::new(plugin().path.to_str().unwrap()).unwrap();
-        assert!((entry.init.unwrap())(path.as_ptr()));
-        let factory = (entry.get_factory.unwrap())(CLAP_PLUGIN_FACTORY_ID.as_ptr()) as *const clap_plugin_factory;
-        let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
-        assert_eq!(CStr::from_ptr((*desc).id), c"plugin-format.sidechain");
-        let plugin = ((*factory).create_plugin.unwrap())(factory, &HOST, (*desc).id);
-        assert!(!plugin.is_null());
-        assert!(((*plugin).init.unwrap())(plugin));
+        let plugin = clap_module::create_at(entry(), &plugin().path, &HOST);
+        assert_eq!(CStr::from_ptr((*(*plugin).desc).id), c"plugin-format.sidechain");
         let configs = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_AUDIO_PORTS_CONFIG.as_ptr()) as *const clap_plugin_audio_ports_config;
         assert!(((*configs).select.unwrap())(plugin, 1));
         assert!(((*plugin).activate.unwrap())(plugin, 48_000.0, 1, 128));

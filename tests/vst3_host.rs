@@ -16,10 +16,12 @@ use vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComPtr, ComWrapper, Interface};
+use vst3::{Class, ComPtr, ComWrapper};
 
 mod built;
 mod vst3_module;
+
+use vst3_module::Instance;
 
 #[cfg(windows)]
 const NATIVE_VIEW: FIDString = kPlatformTypeHWND;
@@ -45,10 +47,7 @@ fn library() -> &'static libloading::Library {
 }
 
 fn factory() -> ComPtr<IPluginFactory> {
-    unsafe {
-        let get: libloading::Symbol<extern "system" fn() -> *mut IPluginFactory> = library().get(b"GetPluginFactory\0").unwrap();
-        ComPtr::from_raw(get()).expect("a factory")
-    }
+    vst3_module::factory(library())
 }
 
 fn text(chars: &[std::ffi::c_char]) -> String {
@@ -60,32 +59,12 @@ fn wide(chars: &[TChar]) -> String {
     String::from_utf16(&chars[..len]).unwrap()
 }
 
-struct Instance {
-    component: ComPtr<IComponent>,
-    processor: ComPtr<IAudioProcessor>,
-    controller: ComPtr<IEditController>,
-}
-
 fn class_id() -> TUID {
-    unsafe {
-        let mut info: PClassInfo = std::mem::zeroed();
-        assert_eq!(factory().getClassInfo(0, &mut info), kResultOk);
-        info.cid
-    }
+    vst3_module::class_id(library())
 }
 
 fn create() -> Instance {
-    unsafe {
-        let cid = class_id();
-        let mut obj = ptr::null_mut();
-        let result = factory().createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj);
-        assert_eq!(result, kResultOk);
-        let component = ComPtr::from_raw(obj as *mut IComponent).expect("a component");
-        assert_eq!(component.initialize(ptr::null_mut()), kResultOk);
-        let processor = component.cast::<IAudioProcessor>().expect("IAudioProcessor");
-        let controller = component.cast::<IEditController>().expect("IEditController");
-        Instance { component, processor, controller }
-    }
+    Instance::create(library())
 }
 
 impl Instance {
@@ -100,14 +79,6 @@ impl Instance {
             assert_eq!(self.processor.setupProcessing(&mut setup), kResultOk);
             assert_eq!(self.component.setActive(1), kResultOk);
             assert_eq!(self.processor.setProcessing(1), kResultOk);
-        }
-    }
-
-    fn stop(&self) {
-        unsafe {
-            self.processor.setProcessing(0);
-            assert_eq!(self.component.setActive(0), kResultOk);
-            assert_eq!(self.component.terminate(), kResultOk);
         }
     }
 

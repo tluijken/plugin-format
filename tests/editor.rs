@@ -3,17 +3,15 @@
 //! `PLUGIN_FORMAT_NO_GL` excuses an editor that cannot open for want of OpenGL (see `NO_GL`).
 //! Runs on the main thread, without the test harness, as AppKit requires.
 
-use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_plugin_gui, clap_window, clap_window_handle};
-use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
-use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
-use clap_sys::version::CLAP_VERSION;
 use plugin_format::{Block, GuiContext, Info, ParamInfo, Plugin, Shared, egui};
+
+mod clap_module;
 
 static FRAMES: AtomicUsize = AtomicUsize::new(0);
 /// What the last frame measured, `width << 32 | height` at a scale of 1.0.
@@ -348,25 +346,10 @@ fn editor_opens_and_closes_fifty_times() {
         eprintln!("skipped: no display to open the editor on");
         return;
     };
-    let host = clap_host {
-        clap_version: CLAP_VERSION,
-        host_data: ptr::null_mut(),
-        name: c"test".as_ptr(),
-        vendor: c"".as_ptr(),
-        url: c"".as_ptr(),
-        version: c"".as_ptr(),
-        get_extension: None,
-        request_restart: None,
-        request_process: None,
-        request_callback: None,
-    };
+    let host = clap_module::host(None, None);
     let entry = plugin_format::clap::entry::<Resizable>();
     unsafe {
-        assert!((entry.init.unwrap())(c"".as_ptr()));
-        let factory = (entry.get_factory.unwrap())(CLAP_PLUGIN_FACTORY_ID.as_ptr()) as *const clap_plugin_factory;
-        let plugin = ((*factory).create_plugin.unwrap())(factory, &host, c"test.resizable".as_ptr());
-        assert!(!plugin.is_null());
-        assert!(((*plugin).init.unwrap())(plugin));
+        let plugin = clap_module::create(&entry, c"", &host);
         let gui = &*(((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_GUI.as_ptr()) as *const clap_plugin_gui);
 
         if let Some(reason) = std::env::var_os(NO_GL).filter(|r| !r.is_empty())
