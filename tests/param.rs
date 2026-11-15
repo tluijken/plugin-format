@@ -2,7 +2,7 @@ use plugin_format::{Kind, Map, ParamInfo};
 
 #[test]
 fn every_int_value_survives_normalising_and_back() {
-    let p = ParamInfo { id: 0, name: "Pedal preset", kind: Kind::Int { min: 0, max: 126 }, default: 0.0, automatable: false };
+    let p = ParamInfo { id: 0, name: "Preset", kind: Kind::Int { min: 0, max: 126 }, default: 0.0, automatable: false };
     for v in 0..=126 {
         assert_eq!(p.plain(p.normalise(v as f64)), v as f64);
     }
@@ -34,7 +34,9 @@ fn non_finite_values_fall_back_to_the_default() {
 #[test]
 fn float_linear_round_trips() {
     let p = ParamInfo { id: 3, name: "Gain", kind: Kind::Float { min: -30.0, max: 30.0, map: Map::Linear }, default: 0.0, automatable: true };
-    assert_eq!(p.plain(p.normalise(12.5)), 12.5);
+    for v in [-30.0, -17.25, -1.0, 0.0, 12.5, 29.9, 30.0] {
+        assert!((p.plain(p.normalise(v)) - v).abs() < 1e-9, "{v}");
+    }
     assert_eq!(p.normalise(0.0), 0.5);
     assert_eq!(p.step_count(), 0);
 }
@@ -43,7 +45,12 @@ fn float_linear_round_trips() {
 fn float_log_round_trips() {
     let p = ParamInfo { id: 4, name: "Frequency", kind: Kind::Float { min: 20.0, max: 20000.0, map: Map::Log }, default: 1000.0, automatable: true };
     assert!((p.normalise(632.455_532_033_675_9) - 0.5).abs() < 1e-9);
-    assert!((p.plain(p.normalise(1000.0)) - 1000.0).abs() < 1e-9);
+    for v in [20.0, 31.5, 100.0, 440.0, 1000.0, 7_777.0, 20_000.0] {
+        assert!((p.plain(p.normalise(v)) - v).abs() < v * 1e-9, "{v}");
+    }
+    for n in [0.0, 0.1, 0.37, 0.5, 0.9, 1.0] {
+        assert!((p.normalise(p.plain(n)) - n).abs() < 1e-9, "{n}");
+    }
     assert_eq!((p.normalise(20.0), p.normalise(20000.0)), (0.0, 1.0));
     assert_eq!(p.step_count(), 0);
 }
