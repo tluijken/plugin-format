@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use egui_baseview::baseview;
 use egui_baseview::baseview::dpi::NativeSize;
@@ -32,6 +32,16 @@ struct GeometryInner {
     min: Option<(u32, u32)>,
     shared: Weak<dyn Shared>,
     repaint: RepaintNotifier,
+    /// What the host last set when no whole size at the scale gives exactly that.
+    exact: Mutex<Option<Exact>>,
+}
+
+/// A physical size the host set, for the whole size and scale it was rounded from.
+#[derive(Clone, Copy, PartialEq)]
+struct Exact {
+    size: (u32, u32),
+    factor: u64,
+    physical: (u32, u32),
 }
 
 fn pack((width, height): (u32, u32)) -> u64 {
@@ -63,6 +73,7 @@ impl Geometry {
             min,
             shared: Arc::downgrade(shared),
             repaint: RepaintNotifier::new(),
+            exact: Mutex::new(None),
         }));
         if let Some(size) = min.and(shared.editor_size()) {
             geometry.0.size.store(pack(geometry.fit(size)), Ordering::Relaxed);
@@ -76,6 +87,7 @@ impl Geometry {
             return false;
         }
         self.0.factor.store(factor.to_bits(), Ordering::Relaxed);
+        *self.0.exact.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.0.repaint.request_repaint();
         true
     }
@@ -95,9 +107,21 @@ impl Geometry {
         unpack(self.0.size.load(Ordering::Relaxed))
     }
 
-    /// The size at this scale, in the platform's pixels.
+    /// The size at this scale, in the platform's pixels: what the host last set where a whole size at this
+    /// scale cannot give that, else the whole size scaled.
     pub fn physical(&self) -> (u32, u32) {
-        self.of(self.size())
+        let (size, factor) = (self.size(), self.0.factor.load(Ordering::Relaxed));
+        match *self.0.exact.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(exact) if exact.size == size && exact.factor == factor => exact.physical,
+            _ => self.of(size),
+        }
+    }
+
+    /// `physical` as a size at a scale of 1.0, not rounded to whole units.
+    pub fn inner_size(&self) -> (f32, f32) {
+        let (width, height) = self.physical();
+        let factor = self.scale();
+        ((width as f64 / factor) as f32, (height as f64 / factor) as f32)
     }
 
     pub fn resizable(&self) -> bool {
@@ -130,6 +154,7 @@ impl Geometry {
         }
         let size = self.fit(size);
         if self.0.size.swap(pack(size), Ordering::Relaxed) != pack(size) {
+            *self.0.exact.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.0.repaint.request_repaint();
             if let Some(shared) = self.0.shared.upgrade() {
                 shared.set_editor_size(size.0, size.1);
@@ -137,10 +162,22 @@ impl Geometry {
         }
     }
 
-    /// Like `resize`, for a size in the platform's pixels at this scale.
+    /// Like `resize`, for a size in the platform's pixels at this scale. Where no whole size gives exactly
+    /// `size`, the nearest one is taken and `physical` still gives `size`, so what the host holds and what
+    /// the window measures agree to the pixel.
     pub fn resize_physical(&self, size: (u32, u32)) {
+        if !self.resizable() {
+            return;
+        }
         let factor = self.scale();
+        let before = self.physical();
         self.resize(((size.0 as f64 / factor).round() as u32, (size.1 as f64 / factor).round() as u32));
+        let whole = self.of(self.size());
+        let rounded = whole != size && whole.0.abs_diff(size.0) <= 1 && whole.1.abs_diff(size.1) <= 1;
+        *self.0.exact.lock().unwrap_or_else(|e| e.into_inner()) = rounded.then(|| Exact { size: self.size(), factor: factor.to_bits(), physical: size });
+        if self.physical() != before {
+            self.0.repaint.request_repaint();
+        }
     }
 }
 
@@ -287,12 +324,12 @@ struct Fit {
     /// same ratio, unless the pass also asks for a size.
     applied: f32,
     /// The size the window was last asked for, at a scale of 1.0.
-    size: (u32, u32),
+    size: (f32, f32),
 }
 
 impl Fit {
     fn new(geometry: Geometry, zoom: f32) -> Self {
-        let size = geometry.size();
+        let size = geometry.inner_size();
         Fit { geometry, applied: zoom, size }
     }
 
@@ -306,11 +343,11 @@ impl Fit {
         if ctx.zoom_factor() != zoom {
             ctx.set_zoom_factor(zoom);
         }
-        let size = self.geometry.size();
+        let size = self.geometry.inner_size();
         if ctx.zoom_factor() != self.applied || size != self.size {
             self.applied = ctx.zoom_factor();
             self.size = size;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.0 as f32, size.1 as f32)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.0, size.1)));
         }
     }
 }
@@ -442,6 +479,51 @@ mod tests {
         let fixed = fixed((380, 220));
         fixed.resize((u32::MAX, u32::MAX));
         assert_eq!(fixed.size(), (380, 220));
+    }
+
+    #[test]
+    fn a_size_the_host_set_at_a_fractional_scale_reads_back_to_the_pixel() {
+        let shared: Arc<dyn Shared> = kept(None);
+        let geometry = Geometry::with((1180, 680), Some((760, 440)), &shared);
+        assert!(geometry.set_scale(1.5));
+        geometry.resize_physical((1500, 901));
+        assert_eq!(geometry.size(), (1000, 601));
+        assert_eq!(geometry.physical(), (1500, 901), "no whole size at this scale gives exactly that");
+        geometry.resize((1000, 601));
+        assert_eq!(geometry.physical(), (1500, 901), "the same size again changes nothing");
+
+        geometry.resize((1100, 700));
+        assert_eq!(geometry.physical(), (1650, 1050));
+        geometry.resize((1000, 601));
+        assert_eq!(geometry.physical(), (1500, 902), "only what the host set holds the host's size");
+
+        geometry.resize_physical((1500, 901));
+        assert!(geometry.set_scale(2.0));
+        assert_eq!(geometry.physical(), (2000, 1202), "a new scale starts from the whole size again");
+    }
+
+    #[test]
+    fn the_window_follows_the_exact_size_the_host_set() {
+        let ctx = egui::Context::default();
+        let shared: Arc<dyn Shared> = kept(None);
+        let mut fit = Fit::new(Geometry::with((1180, 680), Some((760, 440)), &shared), 1.0);
+        assert!(fit.geometry.set_scale(1.5));
+        pass(&ctx, &mut fit, 1.0);
+        pass(&ctx, &mut fit, 1.0);
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![]);
+
+        fit.geometry.resize_physical((1500, 901));
+        let asked = pass(&ctx, &mut fit, 1.0);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(physical(asked[0], ctx.zoom_factor(), 1.0), (1500, 901));
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![]);
+
+        fit.geometry.resize_physical((1500, 901));
+        assert_eq!(pass(&ctx, &mut fit, 1.0), vec![], "the same size again");
+        fit.geometry.resize_physical((1500, 902));
+        let asked = pass(&ctx, &mut fit, 1.0);
+        assert_eq!(asked.len(), 1, "the same whole size, another pixel size");
+        assert_eq!(physical(asked[0], ctx.zoom_factor(), 1.0), (1500, 902));
     }
 
     /// One pass as egui-baseview runs it, with the scale the system reports; the sizes it was asked for.
