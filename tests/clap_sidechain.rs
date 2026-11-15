@@ -13,7 +13,7 @@ use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_plugin_params};
 use clap_sys::fixedpoint::CLAP_SECTIME_FACTOR;
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
-use clap_sys::process::clap_process;
+use clap_sys::process::{CLAP_PROCESS_CONTINUE, clap_process};
 use sidechain::POSITION;
 
 mod built;
@@ -171,6 +171,35 @@ fn zero_frame_block_is_harmless() {
         let plugin = active();
         assert_eq!(play(plugin, 0, 0.25, Some(0.5), ptr::null()), None);
         assert_eq!(play(plugin, 128, 0.25, Some(0.5), ptr::null()), Some(0.75));
+        finish(plugin);
+        (entry().deinit.unwrap())();
+    }
+}
+
+#[test]
+fn a_sidechain_sharing_the_output_buffer_is_treated_as_absent() {
+    let _turn = turn();
+    unsafe {
+        let plugin = active();
+        let mut main_in = [vec![0.25f32; 128], vec![0.25f32; 128]];
+        let mut shared = [vec![0.5f32; 128], vec![0.5f32; 128]];
+        let mut main_ptrs = [main_in[0].as_mut_ptr(), main_in[1].as_mut_ptr()];
+        let mut shared_ptrs = [shared[0].as_mut_ptr(), shared[1].as_mut_ptr()];
+        let inputs = [buffer(&mut main_ptrs, 2), buffer(&mut shared_ptrs, 2)];
+        let mut output = buffer(&mut shared_ptrs, 2);
+        let process = clap_process {
+            steady_time: 0,
+            frames_count: 128,
+            transport: ptr::null(),
+            audio_inputs: inputs.as_ptr(),
+            audio_outputs: &mut output,
+            audio_inputs_count: 2,
+            audio_outputs_count: 1,
+            in_events: ptr::null(),
+            out_events: ptr::null(),
+        };
+        assert_eq!(((*plugin).process.unwrap())(plugin, &process), CLAP_PROCESS_CONTINUE);
+        assert!(shared.iter().all(|channel| channel.iter().all(|&s| s == 0.25)), "{:?}", &shared[0][..4]);
         finish(plugin);
         (entry().deinit.unwrap())();
     }
