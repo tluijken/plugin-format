@@ -157,16 +157,16 @@ mod platform {
                 CreateWindowExW(
                     0,
                     class,
-                    ptr::null(),
+                    std::ptr::null(),
                     WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                     0,
                     0,
                     1200,
                     800,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
                 )
             };
             (!hwnd.is_null()).then_some(Parent(hwnd))
@@ -187,7 +187,7 @@ mod platform {
     pub fn pump() {
         unsafe {
             let mut message: MSG = std::mem::zeroed();
-            while PeekMessageW(&mut message, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
