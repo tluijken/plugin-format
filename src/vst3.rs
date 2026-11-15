@@ -21,7 +21,7 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
-use crate::denormals::FlushDenormals;
+use crate::denormals::{FlushDenormals, with_host_flags};
 use crate::editor::{self, Parent};
 use crate::gui_context::{Event, ResizeId};
 use crate::{Extras, GuiContext, Kind, ParamInfo, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
@@ -234,7 +234,7 @@ impl Host {
         host.cx.connect(Box::new(move |_| {
             let Some(host) = weak.upgrade() else { return };
             if host.on_ui_thread() {
-                host.deliver();
+                with_host_flags(|| host.deliver());
             } else {
                 let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
                 if !waiting.iter().any(|w| w.ptr_eq(&weak)) {
@@ -1906,7 +1906,7 @@ mod tests {
     }
 
     /// Notes whether subnormal results flush to zero while a parameter is set.
-    struct Probe;
+    struct Probe(Mutex<Option<GuiContext>>);
 
     static SET_FLUSHED: AtomicBool = AtomicBool::new(false);
 
@@ -1920,6 +1920,11 @@ mod tests {
         fn set_param(&self, _: u32, _: f64) {
             let product = std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
             SET_FLUSHED.store(product == 0.0, Ordering::SeqCst);
+            let cx = self.0.lock().unwrap().clone();
+            if let Some(cx) = cx {
+                cx.begin(3);
+                cx.end(3);
+            }
         }
         fn param_text(&self, _: u32, _: f64) -> String {
             String::new()
@@ -1936,6 +1941,9 @@ mod tests {
         fn editor(&self, _: crate::GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
             Box::new(|_| {})
         }
+        fn attach(&self, cx: GuiContext) {
+            *self.0.lock().unwrap() = Some(cx);
+        }
     }
 
     struct Probing;
@@ -1945,7 +1953,7 @@ mod tests {
         const EDITOR_SIZE: (u32, u32) = (1, 1);
         type Shared = Probe;
         fn new() -> (Self, Arc<Probe>) {
-            (Probing, Arc::new(Probe))
+            (Probing, Arc::new(Probe(Mutex::new(None))))
         }
         fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
             0
@@ -1965,6 +1973,34 @@ mod tests {
     fn note_host_flags() {
         let product = std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
         HOST_FLAGS_INTACT.fetch_and(product.is_subnormal(), Ordering::SeqCst);
+    }
+
+    static EDITS: AtomicI32 = AtomicI32::new(0);
+
+    struct Checking;
+
+    impl Class for Checking {
+        type Interfaces = (IComponentHandler,);
+    }
+
+    impl IComponentHandlerTrait for Checking {
+        unsafe fn beginEdit(&self, _: ParamID) -> tresult {
+            note_host_flags();
+            EDITS.fetch_add(1, Ordering::SeqCst);
+            kResultOk
+        }
+        unsafe fn performEdit(&self, _: ParamID, _: ParamValue) -> tresult {
+            note_host_flags();
+            kResultOk
+        }
+        unsafe fn endEdit(&self, _: ParamID) -> tresult {
+            note_host_flags();
+            kResultOk
+        }
+        unsafe fn restartComponent(&self, _: int32) -> tresult {
+            note_host_flags();
+            kResultOk
+        }
     }
 
     struct Level;
@@ -2025,6 +2061,9 @@ mod tests {
             assert_eq!(factory.createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj), kResultOk);
             let component = ComPtr::from_raw(obj as *mut IComponent).unwrap();
             let processor = component.cast::<IAudioProcessor>().unwrap();
+            let controller = component.cast::<IEditController>().unwrap();
+            let handler = ComWrapper::new(Checking).to_com_ptr::<IComponentHandler>().unwrap();
+            assert_eq!(controller.setComponentHandler(handler.as_ptr()), kResultOk);
             let changes = ComWrapper::new(OneLevel(ComWrapper::new(Level))).to_com_ptr::<IParameterChanges>().unwrap();
             let mut data = ProcessData {
                 processMode: 0,
@@ -2045,6 +2084,7 @@ mod tests {
             assert!(SET_FLUSHED.load(Ordering::SeqCst), "applied from process");
             assert!(host_product().is_subnormal(), "the host's floating-point state is back");
             assert!(HOST_FLAGS_INTACT.load(Ordering::SeqCst), "the host's parameter changes were read with the host's own flags");
+            assert!(EDITS.load(Ordering::SeqCst) >= 1, "the editor's gesture from set_param reached the handler at once");
         }
     }
 }

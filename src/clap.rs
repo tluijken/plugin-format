@@ -36,7 +36,7 @@ use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_ERROR, clap_process,
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
-use crate::denormals::FlushDenormals;
+use crate::denormals::{FlushDenormals, with_host_flags};
 use crate::editor::{self, Parent};
 use crate::gui_context::{Event, ResizeId, Wake};
 use crate::{Extras, GuiContext, Kind, Layout, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
@@ -270,7 +270,7 @@ impl<P: Plugin> Instance<P> {
                         Wake::Dirty => request_callback,
                     };
                     if let Some(request) = request {
-                        unsafe { request(host as *const clap_host) };
+                        with_host_flags(|| unsafe { request(host as *const clap_host) });
                     }
                 }));
                 instance.shared.attach(instance.cx.clone());
@@ -1049,7 +1049,7 @@ impl<P: Plugin> Instance<P> {
             let size = geometry.fit(size);
             let (width, height) = geometry.of(size);
             // The host may answer with `set_size` before it returns, but need not.
-            if !unsafe { request_resize(host as *const clap_host, width, height) } {
+            if !with_host_flags(|| unsafe { request_resize(host as *const clap_host, width, height) }) {
                 return false;
             }
             geometry.resize(size);
@@ -1584,7 +1584,7 @@ mod tests {
     }
 
     /// Notes whether subnormal results flush to zero while a parameter is set.
-    struct Probe;
+    struct Probe(Mutex<Option<crate::GuiContext>>);
 
     static SET_FLUSHED: AtomicBool = AtomicBool::new(false);
 
@@ -1598,6 +1598,10 @@ mod tests {
         fn set_param(&self, _: u32, _: f64) {
             let product = std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
             SET_FLUSHED.store(product == 0.0, Ordering::SeqCst);
+            let cx = self.0.lock().unwrap().clone();
+            if let Some(cx) = cx {
+                cx.mark_dirty();
+            }
         }
         fn param_text(&self, _: u32, _: f64) -> String {
             String::new()
@@ -1614,6 +1618,9 @@ mod tests {
         fn editor(&self, _: crate::GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
             Box::new(|_| {})
         }
+        fn attach(&self, cx: crate::GuiContext) {
+            *self.0.lock().unwrap() = Some(cx);
+        }
     }
 
     struct Probing;
@@ -1623,7 +1630,7 @@ mod tests {
         const EDITOR_SIZE: (u32, u32) = (1, 1);
         type Shared = Probe;
         fn new() -> (Self, Arc<Probe>) {
-            (Probing, Arc::new(Probe))
+            (Probing, Arc::new(Probe(Mutex::new(None))))
         }
         fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
             0
@@ -1645,6 +1652,19 @@ mod tests {
         HOST_FLAGS_INTACT.fetch_and(product.is_subnormal(), Ordering::SeqCst);
     }
 
+    static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn host_callback(_: *const clap_host) {
+        note_host_flags();
+        CALLBACKS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static PROBE_HOST_STATE: clap_host_state = clap_host_state { mark_dirty: None };
+
+    unsafe extern "C" fn probe_host_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+        if same(id, CLAP_EXT_STATE) { &PROBE_HOST_STATE as *const _ as *const c_void } else { ptr::null() }
+    }
+
     unsafe extern "C" fn one_event(_: *const clap_input_events) -> u32 {
         note_host_flags();
         1
@@ -1664,10 +1684,10 @@ mod tests {
             vendor: c"".as_ptr(),
             url: c"".as_ptr(),
             version: c"".as_ptr(),
-            get_extension: None,
+            get_extension: Some(probe_host_extension),
             request_restart: None,
             request_process: None,
-            request_callback: None,
+            request_callback: Some(host_callback),
         };
         let host_product = || std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
         let event = clap_event_param_value {
@@ -1691,6 +1711,7 @@ mod tests {
             let factory = &Factory::<Probing>::FACTORY;
             let plugin = (factory.create_plugin.unwrap())(factory, &host, c"test.doubler".as_ptr());
             let p = &*plugin;
+            assert!((p.init.unwrap())(plugin));
             let params = (p.get_extension.unwrap())(plugin, CLAP_EXT_PARAMS.as_ptr()) as *const clap_plugin_params;
             assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 16));
 
@@ -1714,6 +1735,7 @@ mod tests {
             assert!(SET_FLUSHED.load(Ordering::SeqCst), "applied from process");
             assert!(host_product().is_subnormal(), "the host's floating-point state is back");
             assert!(HOST_FLAGS_INTACT.load(Ordering::SeqCst), "the host's event list was read with the host's own flags");
+            assert!(CALLBACKS.load(Ordering::SeqCst) >= 2, "the plugin marked itself dirty from set_param in flush and process");
             (p.destroy.unwrap())(plugin);
         }
     }

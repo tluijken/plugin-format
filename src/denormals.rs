@@ -3,6 +3,13 @@
 //! any host. AArch64 starts with them off, so without this its output can hold subnormals that an
 //! x86 host's flags would have hidden.
 
+use std::cell::Cell;
+
+thread_local! {
+    /// The state the host had, while a `FlushDenormals` on this thread has changed it.
+    static HOST: Cell<Option<arch::State>> = const { Cell::new(None) };
+}
+
 /// Sets the flags while it lives and puts the caller's floating-point state back when dropped.
 #[must_use]
 pub(crate) struct FlushDenormals {
@@ -21,6 +28,7 @@ impl FlushDenormals {
         // Only subnormal results change, the guarded region reaches its data through memory, and
         // the asm's memory clobber keeps those loads and stores between the two writes.
         arch::set(state | arch::FLUSH);
+        HOST.set(Some(state));
         Self { saved: Some(state) }
     }
 }
@@ -29,8 +37,27 @@ impl Drop for FlushDenormals {
     fn drop(&mut self) {
         if let Some(state) = self.saved {
             arch::set(state);
+            HOST.set(None);
         }
     }
+}
+
+/// Runs `call`, which reaches into the host, with the floating-point state the host had: a host's own
+/// code is not written for flushed denormals. Without a live `FlushDenormals` on this thread it just
+/// runs `call`.
+pub(crate) fn with_host_flags<R>(call: impl FnOnce() -> R) -> R {
+    struct Back(arch::State);
+
+    impl Drop for Back {
+        fn drop(&mut self) {
+            arch::set(self.0);
+        }
+    }
+
+    let Some(host) = HOST.get() else { return call() };
+    let _back = Back(arch::get());
+    arch::set(host);
+    call()
 }
 
 /// `sse` is an x86 and x86_64 feature only: MXCSR comes with it.
@@ -104,6 +131,18 @@ mod tests {
             assert_eq!(black_box(f32::from_bits(1)) * black_box(1.0f32), 0.0, "a subnormal input reads as zero");
         }
         assert!(product().is_subnormal());
+    }
+
+    #[test]
+    fn a_call_into_the_host_runs_with_the_hosts_flags_and_comes_back_flushing() {
+        assert!(with_host_flags(product).is_subnormal(), "no guard, nothing to undo");
+        let _flushed = FlushDenormals::new();
+        assert_eq!(product(), 0.0);
+        assert!(with_host_flags(product).is_subnormal());
+        assert_eq!(product(), 0.0);
+        let panicked = std::panic::catch_unwind(|| with_host_flags(|| panic!("the host failed")));
+        assert!(panicked.is_err());
+        assert_eq!(product(), 0.0, "flushing again after a panic");
     }
 
     #[test]
