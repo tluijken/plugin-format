@@ -150,6 +150,8 @@ fn position_reaches_the_plugin() {
         assert_eq!(plugin.position(), -1.0);
         plugin.play(128, 0.0, None, &mut context(48_000, true));
         assert_eq!(plugin.position(), 48_000.0);
+        plugin.play(128, 0.0, None, &mut context(2_000_000_000_000_000, true));
+        assert_eq!(plugin.position(), 2e15, "beyond what the parameter once capped");
         plugin.play(128, 0.0, None, &mut context(0, false));
         assert_eq!(plugin.position(), 0.0);
         plugin.play(128, 0.0, None, ptr::null_mut());

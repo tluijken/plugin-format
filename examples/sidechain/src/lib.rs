@@ -5,8 +5,13 @@ use plugin_format::{Block, GuiContext, Info, Kind, Map, ParamInfo, Plugin, Share
 
 pub const POSITION: u32 = 0;
 
+/// The largest sample count an f64 holds exactly.
+const LARGEST_POSITION: f64 = 9_007_199_254_740_992.0;
+
+/// Position is an output the host cannot set, which `set_param` ignores. Hosts that check parameters
+/// by setting them, as clap-validator does, report that, so CI validates the gain example only.
 pub const INFOS: [ParamInfo; 1] =
-    [ParamInfo { id: POSITION, name: "Position", kind: Kind::Float { min: -1.0, max: 1e15, map: Map::Linear }, default: -1.0, automatable: false }];
+    [ParamInfo { id: POSITION, name: "Position", kind: Kind::Float { min: -1.0, max: LARGEST_POSITION, map: Map::Linear }, default: -1.0, automatable: false }];
 
 /// The last block's position as an f64, or -1 when the host gave none.
 pub struct SidechainShared {
