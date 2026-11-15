@@ -753,3 +753,24 @@ fn a_gesture_outside_a_flush_asks_the_host_to_flush_and_goes_out_with_the_next_o
         (entry().deinit.unwrap())();
     }
 }
+
+#[test]
+fn processing_flushes_subnormals_and_leaves_the_hosts_flags_alone() {
+    let _turn = turn();
+    let host_product = || std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
+    unsafe {
+        let plugin = create();
+        let p = &*plugin;
+        assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 128));
+        assert!((p.start_processing.unwrap())(plugin));
+        let list = vec![param_event(GAIN, -60.0)];
+        let mut outputs = [vec![1.0; 128], vec![1.0; 128]];
+        run(plugin, &mut [vec![1e-36; 128]], &mut outputs, 128, &events(&list));
+        assert!(outputs.iter().flatten().all(|&s| s == 0.0), "1e-36 at -60 dB is subnormal: {:?}", &outputs[1][..4]);
+        assert!(host_product().is_subnormal(), "the host's floating-point state is back");
+        (p.stop_processing.unwrap())(plugin);
+        (p.deactivate.unwrap())(plugin);
+        (p.destroy.unwrap())(plugin);
+        (entry().deinit.unwrap())();
+    }
+}

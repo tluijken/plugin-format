@@ -1,6 +1,7 @@
 use core::ffi::CStr;
 
 pub mod clap;
+mod denormals;
 mod editor;
 mod gui_context;
 mod param;
@@ -191,6 +192,7 @@ struct Extras {
 /// A `sidechain` is valid for `frames` reads; one that overlaps an output is dropped.
 unsafe fn process_block<P: Plugin>(plugin: &mut P, frames: usize, outs: &[*mut f32], ins: &[*const f32], configured: usize, extras: Extras) {
     unsafe {
+        let _flushed = denormals::FlushDenormals::new();
         for (c, &out) in outs.iter().enumerate() {
             let source = if c < configured { ins.get(c).copied().unwrap_or(std::ptr::null()) } else { std::ptr::null() };
             if !source.is_null() {

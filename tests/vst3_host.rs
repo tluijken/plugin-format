@@ -691,3 +691,18 @@ fn vst3_channel_context_reaches_the_plugin() {
         plugin.component.terminate();
     }
 }
+
+#[test]
+fn processing_flushes_subnormals_and_leaves_the_hosts_flags_alone() {
+    let _turn = turn();
+    let host_product = || std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
+    let plugin = create();
+    assert_eq!(plugin.arrange(SpeakerArr::kStereo, SpeakerArr::kStereo), kResultTrue);
+    plugin.start(128);
+    let list = changes(&[(GAIN, &[normalised(-60.0)])]);
+    let mut outputs = [vec![1.0; 128], vec![1.0; 128]];
+    assert_eq!(plugin.run(&mut [vec![1e-36; 128], vec![1e-36; 128]], &mut outputs, 128, Some(&list)), kResultOk);
+    assert!(outputs.iter().flatten().all(|&s| s == 0.0), "1e-36 at -60 dB is subnormal: {:?}", &outputs[0][..4]);
+    assert!(host_product().is_subnormal(), "the host's floating-point state is back");
+    plugin.stop();
+}
