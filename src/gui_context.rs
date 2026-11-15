@@ -10,16 +10,17 @@ use crate::{Shared, TrackInfo};
 pub struct GuiContext(Arc<Channel>);
 
 impl GuiContext {
+    /// A context no host is behind, to run an editor or a plugin's editor logic without a plugin instance,
+    /// e.g. in a test. `set` changes `shared` as always, but nothing is sent anywhere: the gestures and
+    /// values are dropped, `request_resize` is false and `track` is `None`. It holds `shared` weakly, as
+    /// the instances' own do.
+    pub fn detached<S: Shared>(shared: &Arc<S>) -> Self {
+        let shared: Weak<dyn Shared> = Arc::downgrade(shared) as Weak<S>;
+        GuiContext(Arc::new(Channel { detached: true, ..Channel::new(shared) }))
+    }
+
     pub(crate) fn new(shared: Weak<dyn Shared>) -> Self {
-        GuiContext(Arc::new(Channel {
-            shared,
-            queue: Queue::default(),
-            dirty: AtomicBool::new(false),
-            wake: RwLock::new(None),
-            resize: RwLock::new(Vec::new()),
-            resizers: AtomicU64::new(0),
-            track: Mutex::new(None),
-        }))
+        GuiContext(Arc::new(Channel::new(shared)))
     }
 
     /// Starts a gesture on `id`, e.g. when a drag begins, so the host groups what follows into one undo step.
@@ -124,6 +125,8 @@ pub(crate) type Resizer = dyn Fn((u32, u32)) -> bool + Send + Sync;
 pub(crate) struct ResizeId(u64);
 
 struct Channel {
+    /// Nothing is queued: no wrapper will drain it.
+    detached: bool,
     /// Weak, since the shared half may keep this context.
     shared: Weak<dyn Shared>,
     queue: Queue,
@@ -135,11 +138,27 @@ struct Channel {
 }
 
 impl Channel {
+    fn new(shared: Weak<dyn Shared>) -> Self {
+        Channel {
+            detached: false,
+            shared,
+            queue: Queue::default(),
+            dirty: AtomicBool::new(false),
+            wake: RwLock::new(None),
+            resize: RwLock::new(Vec::new()),
+            resizers: AtomicU64::new(0),
+            track: Mutex::new(None),
+        }
+    }
+
     fn known(&self, id: u32) -> bool {
         self.shared.upgrade().is_some_and(|shared| shared.params().iter().any(|p| p.id == id))
     }
 
     fn send(&self, event: Event) {
+        if self.detached {
+            return;
+        }
         self.queue.push(event);
         self.wake(Wake::Events);
     }
