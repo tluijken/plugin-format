@@ -62,9 +62,11 @@ jobs:
           scripts/bundle.sh gain Gain com.plugin-format.gain bundles/gain
           scripts/bundle.sh sidechain Sidechain com.plugin-format.sidechain bundles/sidechain
           find bundles
-      # Both validators are built from source on first use, which takes minutes.
-      - name: Validator cache
-        uses: actions/cache@v4
+      # Both validators are built from source on first use, which takes minutes. They are saved even when
+      # validation fails, so a failing plugin does not rebuild them on every run, but only once both are built.
+      - name: Restore validators
+        id: validators
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/validators
           key: validators-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/validators.env') }}
@@ -73,3 +75,16 @@ jobs:
         env:
           VALIDATORS_DIR: ${{ runner.temp }}/validators
         run: scripts/validate.sh bundles/gain
+      - name: Validators built
+        id: built
+        if: always() && steps.validators.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          VALIDATORS_DIR: ${{ runner.temp }}/validators
+        run: if [ -e "$VALIDATORS_DIR/.complete" ]; then echo "complete=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Save validators
+        if: always() && steps.built.outputs.complete == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/validators
+          key: ${{ steps.validators.outputs.cache-primary-key }}

@@ -54,6 +54,9 @@ if [ ! -x "$vst3_validator" ]; then
     cp "$built" "$vst3_validator"
 fi
 
+# Marks a cache directory that holds both validators, which CI saves for later runs.
+touch "$cache/.complete"
+
 summary() {
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         cat >> "$GITHUB_STEP_SUMMARY"
