@@ -13,10 +13,11 @@ use crate::{Plugin, Shared};
 
 /// The editor's size and the host's scale factor, shared by the format's view and the window.
 ///
-/// The size is at a scale of 1.0 and changes only for a resizable editor, never to below its
-/// minimum or above `Geometry::MAX_SIDE`. The scale is the host's, 1.0 until it gives one. On Linux and
-/// Windows the scale the system reports to the window is never used, since the host would not know the size that gives
-/// the window. On macOS sizes are in points, which the system draws at the screen's backing scale.
+/// The size is at a scale of 1.0 and changes only for a resizable editor, never to below its minimum
+/// or above `Geometry::MAX_SIDE`. The scale is the host's, 1.0 until it gives one. On Linux and Windows
+/// the scale the system reports to the window is never used, since the host would not know the size
+/// that gives the window. On macOS sizes are in points, which the system draws at the screen's backing
+/// scale.
 ///
 /// When either changes while the window is open, the window follows on its next frame by resizing
 /// itself, and the parent is resized to match by the host or at the format's request: that keeps the
