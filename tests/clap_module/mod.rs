@@ -3,7 +3,7 @@
 #![allow(dead_code, reason = "each test crate uses part of this")]
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
 
@@ -35,14 +35,15 @@ pub const fn host(get_extension: Option<Extension>, request_callback: Option<Cal
 }
 
 /// The entry of the library at `binary`, which stays loaded for the whole run, as it would in a host.
-/// One library per test crate: later calls get the first one's entry.
+/// A test crate loads one library; asking for another panics.
 ///
 /// # Safety
 /// `binary` is a CLAP plugin library.
 pub unsafe fn load(binary: &Path) -> &'static clap_plugin_entry {
-    static LIBRARY: OnceLock<libloading::Library> = OnceLock::new();
+    static LIBRARY: OnceLock<(PathBuf, libloading::Library)> = OnceLock::new();
     unsafe {
-        let library = LIBRARY.get_or_init(|| libloading::Library::new(binary).unwrap());
+        let (loaded, library) = LIBRARY.get_or_init(|| (binary.to_path_buf(), libloading::Library::new(binary).unwrap()));
+        assert_eq!(loaded, binary, "this test crate already loaded another library");
         let entry: libloading::Symbol<*const clap_plugin_entry> = library.get(b"clap_entry\0").unwrap();
         &**entry
     }
