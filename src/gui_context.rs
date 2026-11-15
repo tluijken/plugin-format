@@ -53,7 +53,9 @@ impl GuiContext {
     /// editor takes the new size by the next frame, or once the host resized it: a VST3 host is asked
     /// on its UI thread, so it may still refuse after this returned true.
     pub fn request_resize(&self, w: u32, h: u32) -> bool {
-        self.0.resize.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|resize| resize((w, h)))
+        // The host may answer from inside the call by closing the editor, which takes the write lock.
+        let resize = self.0.resize.read().unwrap_or_else(|e| e.into_inner()).clone();
+        resize.is_some_and(|resize| resize((w, h)))
     }
 
     /// What the host said about the track the plugin is on, if anything.
@@ -75,7 +77,8 @@ impl GuiContext {
         *self.0.wake.write().unwrap_or_else(|e| e.into_inner()) = Some(wake);
     }
 
-    /// After this returns no `wake` or `resize` runs any more, though clones of this context may live on.
+    /// After this returns no `wake` runs any more and no `resize` starts, though clones of this context may
+    /// live on and a `resize` already under way may still finish.
     pub(crate) fn disconnect(&self) {
         *self.0.wake.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.disconnect_resize();
@@ -83,11 +86,11 @@ impl GuiContext {
 
     /// What `request_resize` does while an editor is open; it may be called from any thread but the
     /// audio thread.
-    pub(crate) fn connect_resize(&self, resize: Resizer) {
-        *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = Some(resize);
+    pub(crate) fn connect_resize(&self, resize: Box<Resizer>) {
+        *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = Some(resize.into());
     }
 
-    /// After this returns no `resize` runs any more.
+    /// After this returns no `resize` starts any more.
     pub(crate) fn disconnect_resize(&self) {
         *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -105,7 +108,7 @@ impl GuiContext {
 
 type Waker = Box<dyn Fn(Wake) + Send + Sync>;
 /// Takes a size at a scale of 1.0; true when the host was asked and has not refused.
-pub(crate) type Resizer = Box<dyn Fn((u32, u32)) -> bool + Send + Sync>;
+pub(crate) type Resizer = dyn Fn((u32, u32)) -> bool + Send + Sync;
 
 struct Channel {
     /// Weak, since the shared half may keep this context.
@@ -113,7 +116,7 @@ struct Channel {
     queue: Queue,
     dirty: AtomicBool,
     wake: RwLock<Option<Waker>>,
-    resize: RwLock<Option<Resizer>>,
+    resize: RwLock<Option<Arc<Resizer>>>,
     track: Mutex<Option<TrackInfo>>,
 }
 
@@ -372,5 +375,52 @@ mod tests {
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| queue.drain(|_| panic!("the host failed"))));
         assert!(panicked.is_err());
         assert_eq!(drained(&queue), [Event::Begin(1), Event::End(1)], "the event being delivered stays first");
+    }
+
+    struct NoShared;
+
+    impl Shared for NoShared {
+        fn params(&self) -> &'static [crate::ParamInfo] {
+            &[]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {}
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self, _: GuiContext) -> crate::Editor {
+            Box::new(|_| {})
+        }
+    }
+
+    fn context() -> GuiContext {
+        let shared: Arc<dyn Shared> = Arc::new(NoShared);
+        GuiContext::new(Arc::downgrade(&shared))
+    }
+
+    #[test]
+    fn a_host_that_closes_the_editor_from_inside_a_resize_request_does_not_hang() {
+        let cx = context();
+        let inner = cx.clone();
+        cx.connect_resize(Box::new(move |_| {
+            inner.disconnect_resize();
+            true
+        }));
+        let (done, finished) = std::sync::mpsc::channel();
+        let asker = cx.clone();
+        std::thread::spawn(move || done.send(asker.request_resize(10, 10)));
+        assert_eq!(finished.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        assert!(!cx.request_resize(10, 10), "disconnected");
     }
 }
