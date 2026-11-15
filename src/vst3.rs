@@ -417,6 +417,7 @@ impl<P: Plugin> Component<P> {
                 let Some(info) = self.info(id) else { continue };
                 let (mut offset, mut value) = (0, 0.0);
                 if points > 0 && queue.getPoint(points - 1, &mut offset, &mut value) == kResultOk {
+                    let _flushed = FlushDenormals::new();
                     self.shared.set_param(id, info.plain(value));
                 }
             }
@@ -715,8 +716,8 @@ impl<P: Plugin> IAudioProcessorTrait for Component<P> {
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         guard(kInternalError, || unsafe {
             let Some(data) = data.as_ref() else { return kInvalidArgument };
-            let _flushed = FlushDenormals::new();
             self.apply(data.inputParameterChanges);
+            let _flushed = FlushDenormals::new();
             self.run(data)
         })
     }
@@ -1959,6 +1960,13 @@ mod tests {
         }
     }
 
+    static HOST_FLAGS_INTACT: AtomicBool = AtomicBool::new(true);
+
+    fn note_host_flags() {
+        let product = std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
+        HOST_FLAGS_INTACT.fetch_and(product.is_subnormal(), Ordering::SeqCst);
+    }
+
     struct Level;
 
     impl Class for Level {
@@ -1967,12 +1975,15 @@ mod tests {
 
     impl IParamValueQueueTrait for Level {
         unsafe fn getParameterId(&self) -> ParamID {
+            note_host_flags();
             3
         }
         unsafe fn getPointCount(&self) -> int32 {
+            note_host_flags();
             1
         }
         unsafe fn getPoint(&self, _: int32, offset: *mut int32, value: *mut ParamValue) -> tresult {
+            note_host_flags();
             unsafe {
                 *offset = 0;
                 *value = 0.5;
@@ -1992,9 +2003,11 @@ mod tests {
 
     impl IParameterChangesTrait for OneLevel {
         unsafe fn getParameterCount(&self) -> int32 {
+            note_host_flags();
             1
         }
         unsafe fn getParameterData(&self, _: int32) -> *mut IParamValueQueue {
+            note_host_flags();
             self.0.as_com_ref::<IParamValueQueue>().map_or(ptr::null_mut(), |queue| queue.as_ptr())
         }
         unsafe fn addParameterData(&self, _: *const ParamID, _: *mut int32) -> *mut IParamValueQueue {
@@ -2031,6 +2044,7 @@ mod tests {
             assert_eq!(processor.process(&mut data), kResultOk);
             assert!(SET_FLUSHED.load(Ordering::SeqCst), "applied from process");
             assert!(host_product().is_subnormal(), "the host's floating-point state is back");
+            assert!(HOST_FLAGS_INTACT.load(Ordering::SeqCst), "the host's parameter changes were read with the host's own flags");
         }
     }
 }

@@ -365,9 +365,9 @@ impl<P: Plugin> Instance<P> {
                     return CLAP_PROCESS_ERROR;
                 }
                 let process = &*process;
+                instance.apply(process.in_events);
                 let status = {
                     let _flushed = FlushDenormals::new();
-                    instance.apply(process.in_events);
                     instance.run(process)
                 };
                 instance.send(process.out_events);
@@ -472,6 +472,7 @@ impl<P: Plugin> Instance<P> {
                     continue;
                 }
                 let event = &*(header as *const clap_event_param_value);
+                let _flushed = FlushDenormals::new();
                 self.shared.set_param(event.param_id, event.value);
             }
         }
@@ -618,10 +619,7 @@ impl<P: Plugin> Instance<P> {
             plugin,
             || (),
             |instance| {
-                {
-                    let _flushed = FlushDenormals::new();
-                    instance.apply(events);
-                }
+                instance.apply(events);
                 instance.send(out);
                 // Not from the audio thread, where an active plugin is flushed and which request_flush forbids.
                 if !instance.active.load(Ordering::Acquire) && instance.cx.pending() {
@@ -1631,11 +1629,20 @@ mod tests {
         }
     }
 
+    static HOST_FLAGS_INTACT: AtomicBool = AtomicBool::new(true);
+
+    fn note_host_flags() {
+        let product = std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
+        HOST_FLAGS_INTACT.fetch_and(product.is_subnormal(), Ordering::SeqCst);
+    }
+
     unsafe extern "C" fn one_event(_: *const clap_input_events) -> u32 {
+        note_host_flags();
         1
     }
 
     unsafe extern "C" fn the_event(list: *const clap_input_events, _: u32) -> *const clap_event_header {
+        note_host_flags();
         unsafe { (*list).ctx as *const clap_event_header }
     }
 
@@ -1697,6 +1704,7 @@ mod tests {
             assert_eq!((p.process.unwrap())(plugin, &process), CLAP_PROCESS_CONTINUE);
             assert!(SET_FLUSHED.load(Ordering::SeqCst), "applied from process");
             assert!(host_product().is_subnormal(), "the host's floating-point state is back");
+            assert!(HOST_FLAGS_INTACT.load(Ordering::SeqCst), "the host's event list was read with the host's own flags");
             (p.destroy.unwrap())(plugin);
         }
     }
