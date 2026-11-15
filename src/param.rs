@@ -1,7 +1,8 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Map {
     Linear,
-    /// Equal normalised steps are equal ratios; `min` must be above zero.
+    /// Equal normalised steps are equal ratios. Needs `0 < min < max`; a range without that maps linearly
+    /// instead, since a logarithm of it is not a number.
     Log,
 }
 
@@ -67,23 +68,30 @@ impl ParamInfo {
         }
     }
 
+    fn log_range(&self) -> Option<(f64, f64)> {
+        match self.kind {
+            Kind::Float { min, max, map: Map::Log } if min > 0.0 && max > min => Some((min, max)),
+            _ => None,
+        }
+    }
+
     pub fn normalise(&self, plain: f64) -> f64 {
         let span = self.max() - self.min();
         if span <= 0.0 {
             return 0.0;
         }
         let plain = self.clamp(plain);
-        match self.kind {
-            Kind::Float { min, max, map: Map::Log } => (plain / min).ln() / (max / min).ln(),
-            _ => (plain - self.min()) / span,
+        match self.log_range() {
+            Some((min, max)) => (plain / min).ln() / (max / min).ln(),
+            None => (plain - self.min()) / span,
         }
     }
 
     pub fn plain(&self, normalised: f64) -> f64 {
         let normalised = normalised.clamp(0.0, 1.0);
-        match self.kind {
-            Kind::Float { min, max, map: Map::Log } => self.clamp(min * (max / min).powf(normalised)),
-            _ => self.clamp(self.min() + normalised * (self.max() - self.min())),
+        match self.log_range() {
+            Some((min, max)) => self.clamp(min * (max / min).powf(normalised)),
+            None => self.clamp(self.min() + normalised * (self.max() - self.min())),
         }
     }
 }

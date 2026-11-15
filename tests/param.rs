@@ -55,3 +55,17 @@ fn float_clamp_keeps_fractions_and_replaces_nan() {
     assert_eq!(p.clamp(f64::NAN), 2.5);
     assert_eq!((p.clamp(99.0), p.clamp(-99.0)), (30.0, -30.0));
 }
+
+#[test]
+fn a_log_range_that_does_not_start_above_zero_maps_linearly() {
+    for (min, max) in [(0.0, 10.0), (-10.0, 10.0)] {
+        let p = ParamInfo { id: 5, name: "Odd", kind: Kind::Float { min, max, map: Map::Log }, default: min, automatable: true };
+        for v in [min, min + 0.25 * (max - min), min + 0.5 * (max - min), max] {
+            let n = p.normalise(v);
+            assert!(n.is_finite() && (0.0..=1.0).contains(&n), "{min}..{max}: {v} -> {n}");
+            assert!((p.plain(n) - v).abs() < 1e-9, "{min}..{max}: {v}");
+        }
+        assert_eq!(p.normalise(min + 0.5 * (max - min)), 0.5);
+        assert_eq!(p.plain(0.5), min + 0.5 * (max - min));
+    }
+}
