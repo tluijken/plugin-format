@@ -1,5 +1,6 @@
 //! Opens the editor in a real window as a CLAP host does, again and again. Needs a display: on
 //! Linux an X server such as Xvfb, else the test is skipped; in CI (`CI` set) it fails instead.
+//! `PLUGIN_FORMAT_NO_GL` excuses an editor that cannot open for want of OpenGL (see `NO_GL`).
 //! Runs on the main thread, without the test harness, as AppKit requires.
 
 use std::ptr;
@@ -307,6 +308,21 @@ unsafe fn open_and_close(plugin: *const clap_plugin, gui: &clap_plugin_gui, pare
     }
 }
 
+/// Set, to the reason, where CI has no OpenGL the editor could draw with: the test then counts as
+/// ignored if the editor cannot open, and still runs in full if it can.
+const NO_GL: &str = "PLUGIN_FORMAT_NO_GL";
+
+/// Whether the editor opens at all.
+unsafe fn opens(plugin: *const clap_plugin, gui: &clap_plugin_gui, parent: &platform::Parent) -> bool {
+    unsafe {
+        assert!((gui.create.unwrap())(plugin, platform::API.as_ptr(), false));
+        let window = clap_window { api: platform::API.as_ptr(), specific: parent.handle() };
+        let opened = (gui.set_parent.unwrap())(plugin, &window);
+        (gui.destroy.unwrap())(plugin);
+        opened
+    }
+}
+
 fn main() {
     editor_opens_and_closes_fifty_times();
 }
@@ -353,6 +369,14 @@ fn editor_opens_and_closes_fifty_times() {
         assert!(((*plugin).init.unwrap())(plugin));
         let gui = &*(((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_GUI.as_ptr()) as *const clap_plugin_gui);
 
+        if let Some(reason) = std::env::var_os(NO_GL).filter(|r| !r.is_empty())
+            && !opens(plugin, gui, &parent)
+        {
+            println!("test editor_opens_and_closes_fifty_times ... ignored, {}", reason.to_string_lossy());
+            ((*plugin).destroy.unwrap())(plugin);
+            (entry.deinit.unwrap())();
+            return;
+        }
         // Whatever the first window starts once for the whole process, e.g. in the GL driver.
         open_and_close(plugin, gui, &parent, 300);
         #[cfg(not(target_os = "macos"))]

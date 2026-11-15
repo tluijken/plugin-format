@@ -207,7 +207,13 @@ pub fn open(parent: Parent, geometry: Geometry, ui: Box<dyn FnMut(&mut egui::Ui)
         #[cfg(target_os = "linux")]
         finished: finished.clone(),
     };
-    let window = EguiWindow::create(settings, editor).ok()?;
+    let window = match EguiWindow::create(settings, editor) {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("plugin-format: cannot open the editor window: {e}");
+            return None;
+        }
+    };
     let window = Window {
         window: ManuallyDrop::new(window),
         #[cfg(target_os = "linux")]

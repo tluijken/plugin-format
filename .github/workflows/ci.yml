@@ -32,6 +32,10 @@ jobs:
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      # The runner has no GPU, so Windows offers no OpenGL 3 context for the editor; Mesa's llvmpipe does.
+      - name: OpenGL for the editor test
+        if: runner.os == 'Windows'
+        uses: ssciwr/setup-mesa-dist-win@2dfeaebfa514f74c2b8cd8d27108c31486d33e72 # v3.0.0
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Clippy
@@ -42,6 +46,8 @@ jobs:
       - name: Test
         if: runner.os != 'Linux'
         run: cargo test --workspace --no-fail-fast
+        env:
+          PLUGIN_FORMAT_NO_GL: ${{ runner.os == 'macOS' && 'the arm64 macOS runner has no hardware OpenGL, which baseview requires' || '' }}
       # The editor test opens real windows.
       - name: Test under Xvfb
         if: runner.os == 'Linux'
