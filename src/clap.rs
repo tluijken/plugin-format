@@ -38,7 +38,7 @@ use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 
 use crate::denormals::FlushDenormals;
 use crate::editor::{self, Parent};
-use crate::gui_context::{Event, Wake};
+use crate::gui_context::{Event, ResizeId, Wake};
 use crate::{Extras, GuiContext, Kind, Layout, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
 
 thread_local! {
@@ -898,7 +898,9 @@ impl<P: Plugin> Instance<P> {
     /// host for a size.
     fn close(&self, gui: &mut Gui) {
         gui.window = None;
-        self.cx.disconnect_resizers();
+        if let Some(id) = gui.resizer.take() {
+            self.cx.disconnect_resize(id);
+        }
     }
 
     /// X11 and Win32 sizes are physical pixels, so the scale applies to both. Cocoa's are points, for
@@ -1027,7 +1029,7 @@ impl<P: Plugin> Instance<P> {
                 instance.close(&mut gui);
                 gui.window = editor::open(parent, gui.geometry.clone(), instance.shared.editor(instance.cx.clone()), Box::new(|| {}));
                 if gui.window.is_some() && P::RESIZABLE {
-                    instance.connect_resize(gui.geometry.clone());
+                    instance.connect_resize(&mut gui);
                 }
                 gui.window.is_some()
             },
@@ -1035,11 +1037,15 @@ impl<P: Plugin> Instance<P> {
     }
 
     /// The host's `request_resize` is thread-safe, so the editor asks it from its own thread.
-    fn connect_resize(&self, geometry: editor::Geometry) {
+    fn connect_resize(&self, gui: &mut Gui) {
         let Some(request_resize) = self.host_request_resize() else { return };
+        if let Some(id) = gui.resizer.take() {
+            self.cx.disconnect_resize(id);
+        }
+        let geometry = gui.geometry.clone();
         // `destroy` disconnects before the host may go away.
         let host = self.host as usize;
-        self.cx.connect_resize(Box::new(move |size| {
+        gui.resizer = Some(self.cx.connect_resize(Box::new(move |size| {
             let size = geometry.fit(size);
             let (width, height) = geometry.of(size);
             // The host may answer with `set_size` before it returns, but need not.
@@ -1048,7 +1054,7 @@ impl<P: Plugin> Instance<P> {
             }
             geometry.resize(size);
             true
-        }));
+        })));
     }
 
     /// Embedded only, so there is no floating window to keep above the host's.
@@ -1089,11 +1095,13 @@ struct Gui {
     created: bool,
     window: Option<editor::Window>,
     geometry: editor::Geometry,
+    /// What this window connected to the context, for `close` to take away again.
+    resizer: Option<ResizeId>,
 }
 
 impl Gui {
     fn new<P: Plugin>(shared: &Arc<P::Shared>) -> Self {
-        Gui { created: false, window: None, geometry: editor::Geometry::new::<P>(shared) }
+        Gui { created: false, window: None, geometry: editor::Geometry::new::<P>(shared), resizer: None }
     }
 }
 
@@ -1489,7 +1497,7 @@ mod tests {
             assert!(!cx.request_resize(900, 900), "nothing to resize without a window");
 
             // What `set_parent` does once the window is open, which needs a display.
-            instance.connect_resize(instance.gui.lock().unwrap().geometry.clone());
+            instance.connect_resize(&mut instance.gui.lock().unwrap());
             assert!(cx.request_resize(100, 2000));
             assert_eq!(*ASKED.lock().unwrap(), [(1140, 3000)]);
             assert_eq!(gui_size_of(gui, plugin), (1140, 3000));
