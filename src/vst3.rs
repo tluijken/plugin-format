@@ -21,6 +21,7 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
+use crate::denormals::FlushDenormals;
 use crate::editor::{self, Parent};
 use crate::gui_context::{Event, ResizeId};
 use crate::{Extras, GuiContext, Kind, ParamInfo, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
@@ -714,6 +715,7 @@ impl<P: Plugin> IAudioProcessorTrait for Component<P> {
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         guard(kInternalError, || unsafe {
             let Some(data) = data.as_ref() else { return kInvalidArgument };
+            let _flushed = FlushDenormals::new();
             self.apply(data.inputParameterChanges);
             self.run(data)
         })
@@ -1900,5 +1902,135 @@ mod tests {
     fn vst3_default_layout_is_the_first() {
         assert_eq!(default_input_arrangement::<StereoFirst>(), SpeakerArr::kStereo);
         assert_eq!(default_input_arrangement::<Doubler>(), SpeakerArr::kMono);
+    }
+
+    /// Notes whether subnormal results flush to zero while a parameter is set.
+    struct Probe;
+
+    static SET_FLUSHED: AtomicBool = AtomicBool::new(false);
+
+    impl Shared for Probe {
+        fn params(&self) -> &'static [ParamInfo] {
+            &[ParamInfo { id: 3, name: "Level", kind: Kind::Float { min: 0.0, max: 10.0, map: crate::Map::Linear }, default: 0.0, automatable: true }]
+        }
+        fn param(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn set_param(&self, _: u32, _: f64) {
+            let product = std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
+            SET_FLUSHED.store(product == 0.0, Ordering::SeqCst);
+        }
+        fn param_text(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn param_from_text(&self, _: u32, _: &str) -> Option<f64> {
+            None
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn editor(&self, _: crate::GuiContext) -> Box<dyn FnMut(&mut egui::Ui) + Send> {
+            Box::new(|_| {})
+        }
+    }
+
+    struct Probing;
+
+    impl Plugin for Probing {
+        const INFO: Info = Doubler::INFO;
+        const EDITOR_SIZE: (u32, u32) = (1, 1);
+        type Shared = Probe;
+        fn new() -> (Self, Arc<Probe>) {
+            (Probing, Arc::new(Probe))
+        }
+        fn activate(&mut self, _: f64, _: usize, _: usize) -> u32 {
+            0
+        }
+        fn deactivate(&mut self) {}
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn process(&mut self, _: Block<'_>) {}
+        fn take_latency_changed(&mut self) -> bool {
+            false
+        }
+    }
+
+    struct Level;
+
+    impl Class for Level {
+        type Interfaces = (IParamValueQueue,);
+    }
+
+    impl IParamValueQueueTrait for Level {
+        unsafe fn getParameterId(&self) -> ParamID {
+            3
+        }
+        unsafe fn getPointCount(&self) -> int32 {
+            1
+        }
+        unsafe fn getPoint(&self, _: int32, offset: *mut int32, value: *mut ParamValue) -> tresult {
+            unsafe {
+                *offset = 0;
+                *value = 0.5;
+            }
+            kResultOk
+        }
+        unsafe fn addPoint(&self, _: int32, _: ParamValue, _: *mut int32) -> tresult {
+            kResultFalse
+        }
+    }
+
+    struct OneLevel(ComWrapper<Level>);
+
+    impl Class for OneLevel {
+        type Interfaces = (IParameterChanges,);
+    }
+
+    impl IParameterChangesTrait for OneLevel {
+        unsafe fn getParameterCount(&self) -> int32 {
+            1
+        }
+        unsafe fn getParameterData(&self, _: int32) -> *mut IParamValueQueue {
+            self.0.as_com_ref::<IParamValueQueue>().map_or(ptr::null_mut(), |queue| queue.as_ptr())
+        }
+        unsafe fn addParameterData(&self, _: *const ParamID, _: *mut int32) -> *mut IParamValueQueue {
+            ptr::null_mut()
+        }
+    }
+
+    #[test]
+    fn parameter_changes_are_applied_with_subnormals_flushed() {
+        let host_product = || std::hint::black_box(1e-36f32) * std::hint::black_box(1e-3f32);
+        unsafe {
+            let factory = ComPtr::from_raw(factory::<Probing>() as *mut IPluginFactory).unwrap();
+            let mut obj = ptr::null_mut();
+            let cid = class_id::<Probing>();
+            assert_eq!(factory.createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj), kResultOk);
+            let component = ComPtr::from_raw(obj as *mut IComponent).unwrap();
+            let processor = component.cast::<IAudioProcessor>().unwrap();
+            let changes = ComWrapper::new(OneLevel(ComWrapper::new(Level))).to_com_ptr::<IParameterChanges>().unwrap();
+            let mut data = ProcessData {
+                processMode: 0,
+                symbolicSampleSize: kSample32 as int32,
+                numSamples: 0,
+                numInputs: 0,
+                numOutputs: 0,
+                inputs: ptr::null_mut(),
+                outputs: ptr::null_mut(),
+                inputParameterChanges: changes.as_ptr(),
+                outputParameterChanges: ptr::null_mut(),
+                inputEvents: ptr::null_mut(),
+                outputEvents: ptr::null_mut(),
+                processContext: ptr::null_mut(),
+            };
+            SET_FLUSHED.store(false, Ordering::SeqCst);
+            assert_eq!(processor.process(&mut data), kResultOk);
+            assert!(SET_FLUSHED.load(Ordering::SeqCst), "applied from process");
+            assert!(host_product().is_subnormal(), "the host's floating-point state is back");
+        }
     }
 }
