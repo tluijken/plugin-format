@@ -11,15 +11,22 @@ pub struct Built {
     pub binary: PathBuf,
 }
 
-/// The library `name` next to the test, in a bundle with `extension` on macOS. Makes the bundle
+/// The library `name` cargo built for the test, in a bundle with `extension` on macOS. Makes the bundle
 /// anew, so call it once per process, before the library is loaded.
 pub fn plugin(name: &str, extension: &str) -> Built {
-    let dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-    let library = dir.join(format!("{}{name}{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX));
-    assert!(library.exists(), "{} not built", library.display());
+    let exe = std::env::current_exe().unwrap();
+    let file = format!("{}{name}{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+    // Cargo's newer build layout keeps each unit in a directory of its own, so the library is then
+    // the one `cargo build` put in the profile directory above the test, not beside it.
+    let library = exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&file))
+        .find(|library| library.exists())
+        .unwrap_or_else(|| panic!("{file} not built next to or above {}: cargo build --workspace", exe.display()));
     #[cfg(target_os = "macos")]
     {
-        let path = dir.join(format!("{name}.{extension}"));
+        let path = exe.parent().unwrap().join(format!("{name}.{extension}"));
         let binary = bundle(&library, &path, name);
         Built { path, binary }
     }

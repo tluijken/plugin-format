@@ -1,6 +1,7 @@
 //! Loads the sidechain example's VST3 library and checks what a host gives the plugin besides the main input.
 
 #![allow(non_snake_case)]
+#![cfg_attr(windows, allow(clippy::unnecessary_cast, reason = "the vst3 enums are i32 on Windows and u32 elsewhere"))]
 
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
