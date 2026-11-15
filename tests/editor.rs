@@ -307,8 +307,14 @@ unsafe fn open_and_close(plugin: *const clap_plugin, gui: &clap_plugin_gui, pare
 }
 
 /// Set, to the reason, where CI has no OpenGL the editor could draw with: the test then counts as
-/// ignored if the editor cannot open, and still runs in full if it can.
+/// ignored if the editor cannot open for want of OpenGL, fails if it cannot open for another reason, and
+/// still runs in full if it opens.
 const NO_GL: &str = "PLUGIN_FORMAT_NO_GL";
+
+/// Whether the window system refused the editor for want of OpenGL, going by what it said.
+fn missing_opengl(refusal: Option<&str>) -> bool {
+    refusal.is_some_and(|refusal| refusal.to_lowercase().contains("opengl"))
+}
 
 /// Whether the editor opens at all.
 unsafe fn opens(plugin: *const clap_plugin, gui: &clap_plugin_gui, parent: &platform::Parent) -> bool {
@@ -322,6 +328,10 @@ unsafe fn opens(plugin: *const clap_plugin, gui: &clap_plugin_gui, parent: &plat
 }
 
 fn main() {
+    assert!(missing_opengl(Some("NSOpenGLPixelFormat initialization failed")));
+    assert!(missing_opengl(Some("Could not find bundle com.apple.opengl")));
+    assert!(!missing_opengl(Some("Failed to create window: invalid parent")));
+    assert!(!missing_opengl(None), "no refusal at all is not a missing OpenGL");
     editor_opens_and_closes_fifty_times();
 }
 
@@ -355,6 +365,8 @@ fn editor_opens_and_closes_fifty_times() {
         if let Some(reason) = std::env::var_os(NO_GL).filter(|r| !r.is_empty())
             && !opens(plugin, gui, &parent)
         {
+            let refusal = plugin_format::clap::last_editor_error();
+            assert!(missing_opengl(refusal.as_deref()), "the editor failed to open, and not for want of OpenGL: {refusal:?}");
             println!("test editor_opens_and_closes_fifty_times ... ignored, {}", reason.to_string_lossy());
             ((*plugin).destroy.unwrap())(plugin);
             (entry.deinit.unwrap())();

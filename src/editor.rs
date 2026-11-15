@@ -225,11 +225,19 @@ impl Drop for Window {
     }
 }
 
+/// Why the last attempt to open a window failed, if the window system refused it.
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn last_open_error() -> Option<String> {
+    LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Opens at `geometry`'s size, in the platform's pixels as CLAP and VST3 hosts measure the parent:
 /// physical pixels on Linux and Windows, points on macOS. `on_frame` runs before `ui` on the window's
 /// thread. `None` when the parent is no window of this platform or the window cannot be opened, e.g.
 /// without a display.
 pub fn open(parent: Parent, geometry: Geometry, ui: Box<dyn FnMut(&mut egui::Ui) + Send>, on_frame: Box<dyn FnMut() + Send>) -> Option<Window> {
+    *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let parent = Handle(raw(parent)?);
     let (width, height) = geometry.physical();
     // Resizable to baseview, which otherwise ignores the sizes the window asks for when the host's
@@ -252,6 +260,7 @@ pub fn open(parent: Parent, geometry: Geometry, ui: Box<dyn FnMut(&mut egui::Ui)
         Ok(window) => window,
         Err(e) => {
             eprintln!("plugin-format: cannot open the editor window: {e}");
+            *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
             return None;
         }
     };

@@ -123,6 +123,13 @@ pub unsafe fn editor<P: Plugin>(plugin: *const clap_plugin) -> Option<crate::Edi
     Some(instance.shared.editor(instance.cx.clone()))
 }
 
+/// Why the last editor window failed to open, as the window system said, for tests to tell a refusal such as
+/// missing OpenGL from a bug.
+#[doc(hidden)]
+pub fn last_editor_error() -> Option<String> {
+    editor::last_open_error()
+}
+
 unsafe extern "C" fn entry_init(_path: *const c_char) -> bool {
     true
 }
