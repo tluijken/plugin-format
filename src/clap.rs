@@ -1601,6 +1601,7 @@ mod tests {
             let cx = self.0.lock().unwrap().clone();
             if let Some(cx) = cx {
                 cx.mark_dirty();
+                cx.request_resize(900, 900);
             }
         }
         fn param_text(&self, _: u32, _: f64) -> String {
@@ -1661,8 +1662,25 @@ mod tests {
 
     static PROBE_HOST_STATE: clap_host_state = clap_host_state { mark_dirty: None };
 
+    static RESIZES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn host_resize(_: *const clap_host, _: u32, _: u32) -> bool {
+        note_host_flags();
+        RESIZES.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    static PROBE_HOST_GUI: clap_host_gui =
+        clap_host_gui { resize_hints_changed: None, request_resize: Some(host_resize), request_show: None, request_hide: None, closed: None };
+
     unsafe extern "C" fn probe_host_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
-        if same(id, CLAP_EXT_STATE) { &PROBE_HOST_STATE as *const _ as *const c_void } else { ptr::null() }
+        if same(id, CLAP_EXT_STATE) {
+            &PROBE_HOST_STATE as *const _ as *const c_void
+        } else if same(id, CLAP_EXT_GUI) {
+            &PROBE_HOST_GUI as *const _ as *const c_void
+        } else {
+            ptr::null()
+        }
     }
 
     unsafe extern "C" fn one_event(_: *const clap_input_events) -> u32 {
@@ -1712,6 +1730,8 @@ mod tests {
             let plugin = (factory.create_plugin.unwrap())(factory, &host, c"test.doubler".as_ptr());
             let p = &*plugin;
             assert!((p.init.unwrap())(plugin));
+            let instance = Instance::<Probing>::from(plugin).unwrap();
+            instance.connect_resize(&mut instance.gui.lock().unwrap());
             let params = (p.get_extension.unwrap())(plugin, CLAP_EXT_PARAMS.as_ptr()) as *const clap_plugin_params;
             assert!((p.activate.unwrap())(plugin, 48_000.0, 1, 16));
 
@@ -1736,6 +1756,7 @@ mod tests {
             assert!(host_product().is_subnormal(), "the host's floating-point state is back");
             assert!(HOST_FLAGS_INTACT.load(Ordering::SeqCst), "the host's event list was read with the host's own flags");
             assert!(CALLBACKS.load(Ordering::SeqCst) >= 2, "the plugin marked itself dirty from set_param in flush and process");
+            assert!(RESIZES.load(Ordering::SeqCst) >= 2, "the plugin asked the host for a size from set_param in flush and process");
             (p.destroy.unwrap())(plugin);
         }
     }
