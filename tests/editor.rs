@@ -141,7 +141,7 @@ mod platform {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, GetCurrentThread, OpenThread, PTP_CALLBACK_INSTANCE, THREAD_QUERY_INFORMATION, TrySubmitThreadpoolCallback,
+        GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, OpenThread, PTP_CALLBACK_INSTANCE, THREAD_QUERY_INFORMATION, TrySubmitThreadpoolCallback,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -207,7 +207,9 @@ mod platform {
         (status == 0).then_some(start)
     }
 
-    /// Where the workers of Windows' thread pool start, the same function for every pool.
+    /// Where the workers of Windows' thread pool start. Observed to be one function for every pool,
+    /// though Windows does not document it; should that change, other pools' workers are counted
+    /// again, which can make the check fail but never pass wrongly.
     fn pool_worker_start() -> usize {
         static START: OnceLock<usize> = OnceLock::new();
         *START.get_or_init(|| {
@@ -234,6 +236,7 @@ mod platform {
             let mut entry: THREADENTRY32 = std::mem::zeroed();
             entry.dwSize = size_of::<THREADENTRY32>() as u32;
             let mut count = 0;
+            let mut counted_self = false;
             let mut more = Thread32First(snapshot, &mut entry) != 0;
             while more {
                 if entry.th32OwnerProcessID == process {
@@ -242,6 +245,7 @@ mod platform {
                     if !thread.is_null() {
                         if start_address(thread).is_some_and(|start| start != pool) {
                             count += 1;
+                            counted_self |= entry.th32ThreadID == GetCurrentThreadId();
                         }
                         CloseHandle(thread);
                     }
@@ -249,6 +253,7 @@ mod platform {
                 more = Thread32Next(snapshot, &mut entry) != 0;
             }
             CloseHandle(snapshot);
+            assert!(counted_self, "no start address read for this thread, so the count would prove nothing");
             count
         }
     }
