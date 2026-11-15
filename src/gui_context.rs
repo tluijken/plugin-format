@@ -16,7 +16,8 @@ impl GuiContext {
             queue: Queue::default(),
             dirty: AtomicBool::new(false),
             wake: RwLock::new(None),
-            resize: RwLock::new(None),
+            resize: RwLock::new(Vec::new()),
+            resizers: AtomicU64::new(0),
             track: Mutex::new(None),
         }))
     }
@@ -54,7 +55,7 @@ impl GuiContext {
     /// on its UI thread, so it may still refuse after this returned true.
     pub fn request_resize(&self, w: u32, h: u32) -> bool {
         // The host may answer from inside the call by closing the editor, which takes the write lock.
-        let resize = self.0.resize.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let resize = self.0.resize.read().unwrap_or_else(|e| e.into_inner()).last().map(|(_, resize)| resize.clone());
         resize.is_some_and(|resize| resize((w, h)))
     }
 
@@ -81,18 +82,26 @@ impl GuiContext {
     /// live on and a `resize` already under way may still finish.
     pub(crate) fn disconnect(&self) {
         *self.0.wake.write().unwrap_or_else(|e| e.into_inner()) = None;
-        self.disconnect_resize();
+        self.disconnect_resizers();
     }
 
-    /// What `request_resize` does while an editor is open; it may be called from any thread but the
-    /// audio thread.
-    pub(crate) fn connect_resize(&self, resize: Box<Resizer>) {
-        *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = Some(resize.into());
+    /// What `request_resize` does while an editor is open, until the returned id is given to
+    /// `disconnect_resize`; it may be called from any thread but the audio thread. Of several, the
+    /// latest connected answers: a host may open a second view before it closes the first.
+    pub(crate) fn connect_resize(&self, resize: Box<Resizer>) -> ResizeId {
+        let id = ResizeId(self.0.resizers.fetch_add(1, Ordering::Relaxed));
+        self.0.resize.write().unwrap_or_else(|e| e.into_inner()).push((id, resize.into()));
+        id
+    }
+
+    /// After this returns that `resize` starts no more, and the others stay.
+    pub(crate) fn disconnect_resize(&self, id: ResizeId) {
+        self.0.resize.write().unwrap_or_else(|e| e.into_inner()).retain(|(connected, _)| *connected != id);
     }
 
     /// After this returns no `resize` starts any more.
-    pub(crate) fn disconnect_resize(&self) {
-        *self.0.resize.write().unwrap_or_else(|e| e.into_inner()) = None;
+    pub(crate) fn disconnect_resizers(&self) {
+        self.0.resize.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Hands the queued events to `deliver` in order until it refuses one, which stays first in the
@@ -110,13 +119,18 @@ type Waker = Box<dyn Fn(Wake) + Send + Sync>;
 /// Takes a size at a scale of 1.0; true when the host was asked and has not refused.
 pub(crate) type Resizer = dyn Fn((u32, u32)) -> bool + Send + Sync;
 
+/// Names one connected `Resizer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResizeId(u64);
+
 struct Channel {
     /// Weak, since the shared half may keep this context.
     shared: Weak<dyn Shared>,
     queue: Queue,
     dirty: AtomicBool,
     wake: RwLock<Option<Waker>>,
-    resize: RwLock<Option<Arc<Resizer>>>,
+    resize: RwLock<Vec<(ResizeId, Arc<Resizer>)>>,
+    resizers: AtomicU64,
     track: Mutex<Option<TrackInfo>>,
 }
 
@@ -414,7 +428,7 @@ mod tests {
         let cx = context();
         let inner = cx.clone();
         cx.connect_resize(Box::new(move |_| {
-            inner.disconnect_resize();
+            inner.disconnect_resizers();
             true
         }));
         let (done, finished) = std::sync::mpsc::channel();
@@ -422,5 +436,27 @@ mod tests {
         std::thread::spawn(move || done.send(asker.request_resize(10, 10)));
         assert_eq!(finished.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
         assert!(!cx.request_resize(10, 10), "disconnected");
+    }
+
+    #[test]
+    fn the_latest_view_asks_and_one_view_closing_leaves_the_others_connected() {
+        let cx = context();
+        let answered = Arc::new(Mutex::new(Vec::new()));
+        let connect = |name: &'static str| {
+            let answered = answered.clone();
+            cx.connect_resize(Box::new(move |_| {
+                answered.lock().unwrap().push(name);
+                true
+            }))
+        };
+        let (first, second) = (connect("first"), connect("second"));
+        assert!(cx.request_resize(1, 1));
+        cx.disconnect_resize(second);
+        assert!(cx.request_resize(1, 1));
+        cx.disconnect_resize(second);
+        assert!(cx.request_resize(1, 1), "disconnecting twice takes nothing else");
+        assert_eq!(*answered.lock().unwrap(), ["second", "first", "first"]);
+        cx.disconnect_resize(first);
+        assert!(!cx.request_resize(1, 1));
     }
 }

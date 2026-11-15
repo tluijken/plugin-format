@@ -22,7 +22,7 @@ use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 use crate::editor::{self, Parent};
-use crate::gui_context::Event;
+use crate::gui_context::{Event, ResizeId};
 use crate::{Extras, GuiContext, Kind, ParamInfo, Plugin, Shared, TrackInfo, copy_str, guard, process_block};
 
 const CATEGORY: &str = "Audio Module Class";
@@ -895,6 +895,8 @@ struct View<P: Plugin> {
     timer: Mutex<Option<Timer>>,
     window: Mutex<Option<editor::Window>>,
     sizing: Arc<Sizing>,
+    /// What this view connected to the context, which may hold other views' too.
+    resizer: Mutex<Option<ResizeId>>,
 }
 
 impl<P: Plugin> Class for View<P> {
@@ -915,6 +917,7 @@ impl<P: Plugin> View<P> {
                 this: AtomicPtr::new(ptr::null_mut()),
                 requested: Mutex::new(None),
             }),
+            resizer: Mutex::new(None),
         }
     }
 
@@ -976,10 +979,18 @@ impl<P: Plugin> View<P> {
             return;
         }
         let sizing = self.sizing.clone();
-        self.host.cx.connect_resize(Box::new(move |size| {
+        let id = self.host.cx.connect_resize(Box::new(move |size| {
             *sizing.requested.lock().unwrap_or_else(|e| e.into_inner()) = Some(sizing.geometry.fit(size));
             true
         }));
+        self.disconnect_resize();
+        *self.resizer.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+    }
+
+    fn disconnect_resize(&self) {
+        if let Some(id) = self.resizer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.host.cx.disconnect_resize(id);
+        }
     }
 
     /// What the editor did last reaches the host before the view is gone, e.g. the end of a gesture
@@ -990,7 +1001,7 @@ impl<P: Plugin> View<P> {
         if let Ok(mut window) = self.window.try_lock() {
             window.take();
         }
-        self.host.cx.disconnect_resize();
+        self.disconnect_resize();
         self.sizing.requested.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.host.tick();
     }
@@ -1807,6 +1818,38 @@ mod tests {
             assert_eq!(plug_view.removed(), kResultOk);
             assert!(!cx.request_resize(900, 900), "nothing to resize once the view is removed");
             assert_eq!(plug_view.setFrame(ptr::null_mut()), kResultOk);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_one_view_leaves_another_views_resize_request_connected() {
+        use Linux::ITimerHandlerTrait;
+        unsafe {
+            let wrapper = ComWrapper::new(Component::<Wide>::new());
+            let open = || {
+                let view = ComWrapper::new(View::<Wide>::new(&wrapper));
+                let plug_view = view.to_com_ptr::<IPlugView>().unwrap();
+                view.sizing.this.store(plug_view.as_ptr(), Ordering::Release);
+                let run_loop = ComWrapper::new(RunLoop::default());
+                run_loop.resizes.store(true, Ordering::SeqCst);
+                assert_eq!(plug_view.setFrame(run_loop.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()), kResultOk);
+                view.start_timer();
+                view.connect_resize();
+                (view, plug_view, run_loop)
+            };
+            let (_first, first_view, first_loop) = open();
+            let (_second, second_view, second_loop) = open();
+            let cx = wrapper.host.cx.clone();
+
+            assert_eq!(second_view.removed(), kResultOk);
+            assert!(cx.request_resize(900, 900), "the first view still takes the request");
+            first_loop.timer.lock().unwrap().clone().expect("the first view's timer").onTimer();
+            assert_eq!(first_loop.asked.lock().unwrap().len(), 1);
+            assert!(second_loop.asked.lock().unwrap().is_empty());
+
+            assert_eq!(first_view.removed(), kResultOk);
+            assert!(!cx.request_resize(900, 900), "nothing to resize once every view is removed");
         }
     }
 

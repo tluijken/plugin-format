@@ -880,7 +880,7 @@ impl<P: Plugin> Instance<P> {
     /// host for a size.
     fn close(&self, gui: &mut Gui) {
         gui.window = None;
-        self.cx.disconnect_resize();
+        self.cx.disconnect_resizers();
     }
 
     /// X11 and Win32 sizes are physical pixels, so the scale applies to both. Cocoa's are points, for
