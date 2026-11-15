@@ -135,9 +135,14 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use std::sync::{OnceLock, mpsc};
+
+    use windows_sys::Wdk::System::Threading::{NtQueryInformationThread, ThreadQuerySetWin32StartAddress};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, GetCurrentThread, OpenThread, PTP_CALLBACK_INSTANCE, THREAD_QUERY_INFORMATION, TrySubmitThreadpoolCallback,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
@@ -194,7 +199,34 @@ mod platform {
         }
     }
 
+    unsafe fn start_address(thread: HANDLE) -> Option<usize> {
+        let mut start = 0usize;
+        let status = unsafe {
+            NtQueryInformationThread(thread, ThreadQuerySetWin32StartAddress, (&raw mut start).cast(), size_of::<usize>() as u32, std::ptr::null_mut())
+        };
+        (status == 0).then_some(start)
+    }
+
+    /// Where the workers of Windows' thread pool start, the same function for every pool.
+    fn pool_worker_start() -> usize {
+        static START: OnceLock<usize> = OnceLock::new();
+        *START.get_or_init(|| {
+            unsafe extern "system" fn report(_: PTP_CALLBACK_INSTANCE, sender: *mut std::ffi::c_void) {
+                let sender = unsafe { Box::from_raw(sender.cast::<mpsc::Sender<usize>>()) };
+                sender.send(unsafe { start_address(GetCurrentThread()) }.unwrap()).unwrap();
+            }
+            let (sender, receiver) = mpsc::channel();
+            let sender = Box::into_raw(Box::new(sender));
+            assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(report), sender.cast(), std::ptr::null()) }, 0);
+            receiver.recv().unwrap()
+        })
+    }
+
+    /// The process's threads but for the thread pool's workers. The pool serves the whole process, the
+    /// loader among others, and keeps a worker that has gone idle for a minute or two, so whether one
+    /// more is alive after the editor has closed says nothing about the editor.
     pub fn threads() -> usize {
+        let pool = pool_worker_start();
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             assert_ne!(snapshot, INVALID_HANDLE_VALUE);
@@ -205,7 +237,14 @@ mod platform {
             let mut more = Thread32First(snapshot, &mut entry) != 0;
             while more {
                 if entry.th32OwnerProcessID == process {
-                    count += 1;
+                    let thread = OpenThread(THREAD_QUERY_INFORMATION, 0, entry.th32ThreadID);
+                    // A thread that has exited since the snapshot tells no start address.
+                    if !thread.is_null() {
+                        if start_address(thread).is_some_and(|start| start != pool) {
+                            count += 1;
+                        }
+                        CloseHandle(thread);
+                    }
                 }
                 more = Thread32Next(snapshot, &mut entry) != 0;
             }
