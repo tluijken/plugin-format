@@ -1,6 +1,6 @@
 [package]
 name = "plugin-format"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "CLAP and VST3 export for a plugin written once against a small trait, with an egui editor"
