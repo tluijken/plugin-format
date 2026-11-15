@@ -26,10 +26,8 @@ vst3 = "0.3"
 [dev-dependencies]
 gain = { path = "examples/gain" }
 sidechain = { path = "examples/sidechain" }
-clap-sys = "0.5"
 libloading = "0.8"
 serde_json = "1"
-vst3 = "0.3"
 
 # A parent window for the editor test, and the process's threads on Windows.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
