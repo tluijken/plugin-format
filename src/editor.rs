@@ -14,8 +14,8 @@ use crate::{Plugin, Shared};
 /// The editor's size and the host's scale factor, shared by the format's view and the window.
 ///
 /// The size is at a scale of 1.0 and changes only for a resizable editor, never to below its
-/// minimum. The scale is the host's, 1.0 until it gives one. On Linux and Windows the scale the
-/// system reports to the window is never used, since the host would not know the size that gives
+/// minimum or above `Geometry::MAX_SIDE`. The scale is the host's, 1.0 until it gives one. On Linux and
+/// Windows the scale the system reports to the window is never used, since the host would not know the size that gives
 /// the window. On macOS sizes are in points, which the system draws at the screen's backing scale.
 ///
 /// When either changes while the window is open, the window follows on its next frame by resizing
@@ -44,6 +44,10 @@ fn unpack(size: u64) -> (u32, u32) {
 
 impl Geometry {
     const RANGE: std::ops::RangeInclusive<f64> = 0.25..=8.0;
+
+    /// The largest side of a resizable editor at a scale of 1.0, beyond what any window or texture takes: a
+    /// size nobody asked for sensibly must not reach the window or the 32-bit sizes of the formats.
+    const MAX_SIDE: u32 = 16384;
 
     /// At the size the plugin keeps for a resizable editor, or else `P::EDITOR_SIZE`.
     pub fn new<P: Plugin>(shared: &Arc<P::Shared>) -> Self {
@@ -103,7 +107,7 @@ impl Geometry {
     /// The size nearest `size` the editor can take, both at a scale of 1.0.
     pub fn fit(&self, size: (u32, u32)) -> (u32, u32) {
         match self.0.min {
-            Some(min) => (size.0.max(min.0), size.1.max(min.1)),
+            Some(min) => (size.0.clamp(min.0, Self::MAX_SIDE.max(min.0)), size.1.clamp(min.1, Self::MAX_SIDE.max(min.1))),
             None => self.size(),
         }
     }
@@ -112,8 +116,8 @@ impl Geometry {
     pub fn fit_physical(&self, size: (u32, u32)) -> (u32, u32) {
         match self.0.min {
             Some(min) => {
-                let min = self.of(min);
-                (size.0.max(min.0), size.1.max(min.1))
+                let (largest, min) = (self.of((Self::MAX_SIDE, Self::MAX_SIDE)), self.of(min));
+                (size.0.clamp(min.0, largest.0.max(min.0)), size.1.clamp(min.1, largest.1.max(min.1)))
             }
             None => self.physical(),
         }
@@ -415,6 +419,29 @@ mod tests {
 
         let fresh: Arc<dyn Shared> = kept(None);
         assert_eq!(Geometry::with((1180, 680), Some((760, 440)), &fresh).size(), (1180, 680));
+    }
+
+    #[test]
+    fn a_resizable_editor_never_takes_a_size_above_the_largest() {
+        let shared = kept(Some((u32::MAX, 5)));
+        let dynamic: Arc<dyn Shared> = shared.clone();
+        let geometry = Geometry::with((1180, 680), Some((760, 440)), &dynamic);
+        let largest = Geometry::MAX_SIDE;
+        assert_eq!(geometry.size(), (largest, 440), "a kept size no window could take");
+
+        geometry.resize((u32::MAX, u32::MAX));
+        assert_eq!(geometry.size(), (largest, largest));
+        assert_eq!(*shared.told.lock().unwrap(), [(largest, largest)]);
+        assert!(geometry.set_scale(8.0));
+        assert_eq!(geometry.physical(), (largest * 8, largest * 8));
+        assert_eq!(geometry.fit_physical((u32::MAX, 10)), (largest * 8, 3520));
+        geometry.resize_physical((u32::MAX, 2000));
+        assert_eq!(geometry.size(), (largest, 440));
+        assert!(i32::try_from(geometry.physical().0).is_ok());
+
+        let fixed = fixed((380, 220));
+        fixed.resize((u32::MAX, u32::MAX));
+        assert_eq!(fixed.size(), (380, 220));
     }
 
     /// One pass as egui-baseview runs it, with the scale the system reports; the sizes it was asked for.
